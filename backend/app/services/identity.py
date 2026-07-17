@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import Permission, Role, RolePermission, User, UserRole
@@ -49,6 +49,19 @@ def get_permission_codes(user: User) -> list[str]:
     )
 
 
+def lock_admin_role(db: Session) -> Role | None:
+    return db.scalar(select(Role).where(Role.code == "ADMIN").with_for_update())
+
+
+def count_active_admins(db: Session) -> int:
+    return db.scalar(
+        select(func.count(distinct(User.id)))
+        .join(UserRole, UserRole.user_id == User.id)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(User.is_active.is_(True), Role.code == "ADMIN")
+    ) or 0
+
+
 def seed_identity(db: Session, admin_username: str, admin_password: str) -> User:
     permissions: dict[str, Permission] = {}
     for code, name in DEFAULT_PERMISSIONS.items():
@@ -81,6 +94,10 @@ def seed_identity(db: Session, admin_username: str, admin_password: str) -> User
         )
         user.role_links.append(UserRole(role=roles["ADMIN"]))
         db.add(user)
+    else:
+        user.is_active = True
+        if "ADMIN" not in get_role_codes(user):
+            user.role_links.append(UserRole(role=roles["ADMIN"]))
 
     db.commit()
     return user

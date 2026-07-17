@@ -1,5 +1,3 @@
-from uuid import uuid4
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +6,7 @@ from fastapi.responses import JSONResponse
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
+from app.core.request_id import normalize_request_id
 
 
 settings = get_settings()
@@ -23,7 +22,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
-    request.state.request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    request.state.request_id = normalize_request_id(request.headers.get("X-Request-ID"))
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
     return response

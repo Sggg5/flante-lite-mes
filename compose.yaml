@@ -28,7 +28,7 @@ services:
       INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME:-admin}
       INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:?Set INITIAL_ADMIN_PASSWORD in .env}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-flante_mes}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flante_mes}
-      CORS_ORIGINS: http://localhost:8080
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env}
     depends_on:
       postgres:
         condition: service_healthy

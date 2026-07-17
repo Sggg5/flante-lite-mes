@@ -199,3 +199,66 @@ docker compose ps
 - 本地初始化顺序是 Alembic 升级后运行 `python -m app.scripts.init_db`。
 - Docker 验收必须在具备 Docker Desktop 的环境补跑，不能用静态 YAML 校验替代最终验收。
 - 阶段 1 完成后停止，不进入 Excel、补库、排产或报工开发。
+
+## 6. 阶段 1 审查修复补充
+
+本次仅修复阶段 1 基础框架审查问题，未进入阶段 2，未开发 Excel 导入、补库计算、排产或报工功能。
+
+### 6.1 管理员保护
+
+- 角色修改接口会阻止移除最后一个启用状态 `ADMIN` 用户的管理员角色。
+- 唯一管理员移除自己的 `ADMIN` 角色时返回稳定错误码 `CANNOT_REMOVE_LAST_ADMIN`。
+- 其他有 `user.manage` 权限的用户尝试让系统不存在管理员时返回稳定错误码 `LAST_ADMIN_REQUIRED`。
+- `init_db` 对已存在的初始管理员不会重置密码；如果该用户缺少 `ADMIN` 角色或处于停用状态，会恢复为启用管理员。
+
+新增测试：
+
+- `backend/tests/test_admin_protection.py::test_last_admin_cannot_remove_own_admin_role`
+- `backend/tests/test_admin_protection.py::test_role_change_cannot_leave_system_without_admin`
+- `backend/tests/test_admin_protection.py::test_init_db_restores_admin_role_without_resetting_password`
+
+### 6.2 生产配置安全
+
+- `APP_ENV=production` 时拒绝开发默认 `SECRET_KEY`。
+- `SECRET_KEY` 长度必须至少 32 位。
+- 生产环境必须设置 `INITIAL_ADMIN_PASSWORD`。
+- 生产环境必须显式设置 `CORS_ORIGINS`。
+
+新增测试：
+
+- `backend/tests/test_config.py::test_development_settings_allow_local_cors_default`
+- `backend/tests/test_config.py::test_production_rejects_development_secret_key`
+- `backend/tests/test_config.py::test_secret_key_must_be_at_least_32_characters`
+- `backend/tests/test_config.py::test_production_requires_initial_admin_password`
+- `backend/tests/test_config.py::test_production_requires_explicit_cors_origins`
+- `backend/tests/test_config.py::test_valid_production_settings_are_accepted`
+
+### 6.3 请求编号安全
+
+- `X-Request-ID` 最大长度为 64 位。
+- 仅允许字母、数字、短横线和下划线。
+- 缺失、超长或包含非法字符时自动生成 UUID。
+- 规范化后的请求编号会写入响应头和审计日志，避免 PostgreSQL 审计日志字段超长失败。
+
+新增测试：
+
+- `backend/tests/test_request_id.py::test_valid_request_id_is_preserved_in_response_and_audit_log`
+- `backend/tests/test_request_id.py::test_overlong_request_id_is_replaced_before_audit_log_write`
+- `backend/tests/test_request_id.py::test_request_id_with_invalid_characters_is_replaced`
+
+### 6.4 CI 和测试数据规则
+
+- 新增 `.github/workflows/ci.yml`，PR 和 push 时执行后端、前端和 Docker Compose 三类验证。
+- Docker CI 会真实构建镜像、启动 PostgreSQL/backend/frontend、等待健康检查、检查 `/health`、检查前端首页并调用登录接口做冒烟测试，结束后执行 `docker compose down -v`。
+- 新增 `docs/脱敏测试数据规则.md`，明确不得提交客户名称、价格金额、真实订单号、真实批次号、员工信息和未脱敏经营数据。
+- 新增 `tests/fixtures/README.md`，为阶段 2 预留虚拟产品编码和虚拟数量的测试样本规则。
+
+### 6.5 本次验证结果
+
+- 后端：`.\.venv\Scripts\python.exe -m pytest`，结果 `17 passed, 1 warning`。
+- Alembic：`.\.venv\Scripts\python.exe -m alembic upgrade head`、`downgrade base`、再次 `upgrade head`、`check` 均通过，`check` 输出 `No new upgrade operations detected.`。
+- 前端类型检查：`npm.cmd run type-check` 通过。
+- 前端测试：`npm.cmd run test:run`，结果 `2 passed`。
+- 前端构建：`npm.cmd run build` 通过；存在 Vite/Rollup 对第三方 PURE 注释和 chunk 大小的 warning，不影响构建结果。
+- 本机 Docker Compose：当前 Windows 环境没有 Docker CLI，`docker compose version` 返回 `The term 'docker' is not recognized`，因此本机无法实际启动容器。
+- GitHub Actions Docker Compose：将在本次修复提交推送后执行真实容器启动、健康检查和登录冒烟测试。

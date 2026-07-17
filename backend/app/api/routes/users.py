@@ -8,7 +8,7 @@ from app.core.errors import error_payload
 from app.models import Role, User, UserRole
 from app.schemas.auth import UpdateUserRolesRequest, UserRolesResponse
 from app.services.audit import write_audit_log
-from app.services.identity import get_role_codes, get_user_by_id
+from app.services.identity import count_active_admins, get_role_codes, get_user_by_id, lock_admin_role
 
 
 router = APIRouter(prefix="/api/v1/users", tags=["users"])
@@ -30,6 +30,7 @@ def update_user_roles(
         )
 
     requested_codes = sorted(set(payload.role_codes))
+    lock_admin_role(db)
     roles = list(db.scalars(select(Role).where(Role.code.in_(requested_codes))))
     found_codes = {role.code for role in roles}
     missing_codes = sorted(set(requested_codes) - found_codes)
@@ -40,6 +41,18 @@ def update_user_roles(
         )
 
     before_codes = get_role_codes(user)
+    removes_admin_from_active_user = user.is_active and "ADMIN" in before_codes and "ADMIN" not in requested_codes
+    if removes_admin_from_active_user and count_active_admins(db) <= 1:
+        error_code = "CANNOT_REMOVE_LAST_ADMIN" if actor.id == user.id else "LAST_ADMIN_REQUIRED"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error_payload(
+                request,
+                error_code,
+                "系统必须至少保留一个启用状态且具有 ADMIN 角色的用户",
+            ),
+        )
+
     user.role_links.clear()
     user.role_links.extend(UserRole(role=role) for role in roles)
     db.flush()
