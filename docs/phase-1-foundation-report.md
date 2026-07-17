@@ -261,4 +261,5 @@ docker compose ps
 - 前端测试：`npm.cmd run test:run`，结果 `2 passed`。
 - 前端构建：`npm.cmd run build` 通过；存在 Vite/Rollup 对第三方 PURE 注释和 chunk 大小的 warning，不影响构建结果。
 - 本机 Docker Compose：当前 Windows 环境没有 Docker CLI，`docker compose version` 返回 `The term 'docker' is not recognized`，因此本机无法实际启动容器。
-- GitHub Actions Docker Compose：将在本次修复提交推送后执行真实容器启动、健康检查和登录冒烟测试。
+- GitHub Actions：PR 和 push 触发的两组 CI 均已通过。
+- GitHub Actions Docker Compose：已真实执行 `docker compose config`、`docker compose build`、`docker compose up -d --wait --wait-timeout 240`、`curl http://localhost:8000/health`、`curl http://localhost:8080/`、登录接口冒烟测试和 `docker compose down -v`，结果通过。
