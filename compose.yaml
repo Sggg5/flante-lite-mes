@@ -57,7 +57,7 @@ services:
     ports:
       - "8080:80"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/ || exit 1"]
+      test: ["CMD", "nginx", "-t"]
       interval: 10s
       timeout: 5s
       retries: 10
