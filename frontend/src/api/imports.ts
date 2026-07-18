@@ -17,6 +17,13 @@ export function describeImportError(error: unknown): string {
   return backendMessage ? `后端处理失败：${backendMessage}` : '后端处理失败，请查看批次详情中的错误信息'
 }
 
+export function describeRollbackError(error: unknown): string {
+  if (axios.isAxiosError(error) && (error.code === 'ECONNABORTED' || !error.response)) {
+    return '撤销请求超时，后端可能仍在执行，请刷新批次状态确认，不要重复提交'
+  }
+  return describeImportError(error)
+}
+
 export type ImportStatus =
   | 'UPLOADED' | 'ANALYZED' | 'VALIDATION_FAILED' | 'READY'
   | 'IMPORTING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'ROLLED_BACK'
@@ -136,7 +143,7 @@ export async function confirmImport(batchId: number) {
 }
 
 export async function rollbackImport(batchId: number, reason: string) {
-  return (await http.post<ImportBatch>(`/v1/imports/${batchId}/rollback`, { reason })).data
+  return (await http.post<ImportBatch>(`/v1/imports/${batchId}/rollback`, { reason }, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function listImportIssues(batchId: number, severity?: string) {

@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
 
 import {
-  IMPORT_TYPE_LABELS, analyzeImport, confirmImport, describeImportError, downloadImportIssues, getImportPreview, getImportSheets,
+  IMPORT_TYPE_LABELS, analyzeImport, confirmImport, describeImportError, describeRollbackError, downloadImportIssues, getImportPreview, getImportSheets,
   listImportAuditLogs, listImportIssues, listImports, listWeeklyPlanStaging, matchWeeklyPlanRow,
   rollbackImport, searchProductCandidates, updateImportMapping, uploadImport, validateImport,
   type ImportAuditLog, type ImportBatch, type ImportIssue, type PreviewRow, type ProductCandidate,
@@ -16,6 +16,7 @@ const auth = useAuthStore()
 const loading = ref(false)
 const importProcessing = ref(false)
 const uploadProgress = ref(0)
+const rollbackProcessing = ref(false)
 const batches = ref<ImportBatch[]>([])
 const total = ref(0)
 const filters = reactive({ import_type: '', status: '', page: 1, page_size: 20 })
@@ -190,11 +191,18 @@ async function openDetail(batch: ImportBatch) {
 }
 
 async function rollbackBatch() {
-  if (!detailBatch.value) return
+  if (!detailBatch.value || rollbackProcessing.value) return
   const result = await ElMessageBox.prompt('请输入撤销原因', '撤销导入批次', { inputValidator: (value) => value.length >= 2 || '至少输入2个字符' })
-  detailBatch.value = await rollbackImport(detailBatch.value.id, result.value)
-  ElMessage.success('导入批次已撤销')
-  await refresh()
+  rollbackProcessing.value = true
+  try {
+    detailBatch.value = await rollbackImport(detailBatch.value.id, result.value)
+    ElMessage.success('导入批次已撤销')
+    await refresh()
+  } catch (error) {
+    ElMessage.error(describeRollbackError(error))
+  } finally {
+    rollbackProcessing.value = false
+  }
 }
 
 async function exportIssues() {
@@ -251,7 +259,7 @@ onMounted(refresh)
     </el-dialog>
 
     <el-drawer v-model="detailVisible" size="58%" title="导入批次详情" data-testid="batch-detail">
-      <template v-if="detailBatch"><el-descriptions border :column="2"><el-descriptions-item label="批次号">{{ detailBatch.batch_no }}</el-descriptions-item><el-descriptions-item label="状态">{{ detailBatch.status }}</el-descriptions-item><el-descriptions-item label="文件">{{ detailBatch.original_filename }}</el-descriptions-item><el-descriptions-item label="SHA-256"><code>{{ detailBatch.file_sha256 }}</code></el-descriptions-item><el-descriptions-item label="工作表">{{ detailBatch.selected_sheet_name }}</el-descriptions-item><el-descriptions-item label="数据日期">{{ detailBatch.source_date || '未设置' }}</el-descriptions-item><el-descriptions-item label="隐藏行策略">{{ detailBatch.include_hidden_rows ? '导入所有物理行' : '仅导入可见行' }}</el-descriptions-item><el-descriptions-item label="隐藏数据统计">共 {{ detailBatch.hidden_data_rows ?? 0 }} 行 / 排除 {{ detailBatch.excluded_hidden_data_rows ?? 0 }} 行</el-descriptions-item><el-descriptions-item label="主数据策略">{{ detailBatch.master_data_policy }}</el-descriptions-item><el-descriptions-item label="统计">有效 {{ detailBatch.valid_rows }} / 警告 {{ detailBatch.warning_rows }} / 错误 {{ detailBatch.error_rows }}</el-descriptions-item></el-descriptions><h3>字段映射</h3><pre>{{ JSON.stringify(detailBatch.field_mapping, null, 2) }}</pre><div class="detail-actions"><el-button link type="primary" @click="exportIssues">下载错误明细</el-button><el-button v-if="canRollback && detailBatch.status === 'COMPLETED'" type="danger" plain @click="rollbackBatch">撤销批次</el-button></div><h3>错误与警告</h3><el-table :data="detailIssues"><el-table-column prop="excel_row_number" label="行号" width="80" /><el-table-column prop="severity" label="等级" width="90" /><el-table-column prop="field_name" label="字段" width="140" /><el-table-column prop="message" label="说明" /></el-table><h3>操作日志</h3><el-table :data="detailAuditLogs"><el-table-column prop="occurred_at" label="时间" width="185" /><el-table-column prop="action" label="动作" width="180" /><el-table-column prop="user_id" label="操作人ID" width="100" /><el-table-column prop="reason" label="原因" /><el-table-column prop="request_id" label="请求编号" min-width="220" /></el-table></template>
+      <template v-if="detailBatch"><el-descriptions border :column="2"><el-descriptions-item label="批次号">{{ detailBatch.batch_no }}</el-descriptions-item><el-descriptions-item label="状态">{{ detailBatch.status }}</el-descriptions-item><el-descriptions-item label="文件">{{ detailBatch.original_filename }}</el-descriptions-item><el-descriptions-item label="SHA-256"><code>{{ detailBatch.file_sha256 }}</code></el-descriptions-item><el-descriptions-item label="工作表">{{ detailBatch.selected_sheet_name }}</el-descriptions-item><el-descriptions-item label="数据日期">{{ detailBatch.source_date || '未设置' }}</el-descriptions-item><el-descriptions-item label="隐藏行策略">{{ detailBatch.include_hidden_rows ? '导入所有物理行' : '仅导入可见行' }}</el-descriptions-item><el-descriptions-item label="隐藏数据统计">共 {{ detailBatch.hidden_data_rows ?? 0 }} 行 / 排除 {{ detailBatch.excluded_hidden_data_rows ?? 0 }} 行</el-descriptions-item><el-descriptions-item label="主数据策略">{{ detailBatch.master_data_policy }}</el-descriptions-item><el-descriptions-item label="统计">有效 {{ detailBatch.valid_rows }} / 警告 {{ detailBatch.warning_rows }} / 错误 {{ detailBatch.error_rows }}</el-descriptions-item></el-descriptions><h3>字段映射</h3><pre>{{ JSON.stringify(detailBatch.field_mapping, null, 2) }}</pre><el-alert v-if="rollbackProcessing" title="正在撤销，请勿重复操作" type="warning" show-icon :closable="false" /><div class="detail-actions"><el-button link type="primary" @click="exportIssues">下载错误明细</el-button><el-button v-if="canRollback && detailBatch.status === 'COMPLETED'" type="danger" plain :loading="rollbackProcessing" :disabled="rollbackProcessing" @click="rollbackBatch">{{ rollbackProcessing ? '正在撤销，请勿重复操作' : '撤销批次' }}</el-button></div><h3>错误与警告</h3><el-table :data="detailIssues"><el-table-column prop="excel_row_number" label="行号" width="80" /><el-table-column prop="severity" label="等级" width="90" /><el-table-column prop="field_name" label="字段" width="140" /><el-table-column prop="message" label="说明" /></el-table><h3>操作日志</h3><el-table :data="detailAuditLogs"><el-table-column prop="occurred_at" label="时间" width="185" /><el-table-column prop="action" label="动作" width="180" /><el-table-column prop="user_id" label="操作人ID" width="100" /><el-table-column prop="reason" label="原因" /><el-table-column prop="request_id" label="请求编号" min-width="220" /></el-table></template>
     </el-drawer>
   </section>
 </template>
