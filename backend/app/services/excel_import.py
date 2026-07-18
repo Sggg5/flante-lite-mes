@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import zipfile
 from collections import Counter
@@ -27,6 +28,7 @@ from app.models import (
     Product,
     RegularProductionProduct,
     ShipmentRecord,
+    WeeklyPlanStagingRow,
 )
 
 
@@ -85,6 +87,13 @@ REQUIRED_FIELDS: dict[str, set[str]] = {
     "FITTING_WIP": {"product_code", "quantity"},
     "REGULAR_PRODUCT": {"product_code"},
     "WEEKLY_PLAN": {"product_code", "production_batch_no", "process_name", "equipment_name", "planned_quantity"},
+}
+
+WEEKLY_SHEET_LAYOUTS: dict[str, dict[str, Any]] = {
+    "制管": {"header_end": 5, "equipment": 1, "name": 3, "spec": 4, "batch": 5, "process": 6, "row_kind": 12, "total": 13, "daily": range(14, 21)},
+    "包装": {"header_end": 4, "equipment": 1, "name": 2, "spec": 3, "batch": 4, "process": 5, "row_kind": 10, "total": 11, "daily": range(12, 19)},
+    "成型": {"header_end": 5, "equipment": 1, "name": 3, "spec": 4, "batch": 5, "process": 6, "row_kind": 11, "total": 12, "daily": range(13, 20)},
+    "下料": {"header_end": 4, "equipment": None, "name": 1, "spec": 2, "batch": 3, "process": None, "row_kind": 8, "total": 9, "daily": range(10, 17)},
 }
 
 
@@ -261,7 +270,13 @@ def analyze_workbook(path: Path, import_type: str, selected_sheet: str | None = 
             for row in worksheet.iter_rows(min_row=1, max_row=min(max(effective["last_row"], 1), 12)):
                 preview_rows.append([cell.value for cell in row[: max(effective["last_column"], 1)]])
             header_start, header_end, mapping = detect_header(preview_rows, import_type)
-            detected_dates = sorted({parsed for row in preview_rows for value in row if (parsed := parse_date(value)) is not None})
+            detected_dates = sorted({
+                parsed
+                for row in preview_rows[:header_end]
+                for value in row
+                if isinstance(value, (date, datetime)) or (isinstance(value, (int, float)) and value > 30_000) or (isinstance(value, str) and re.search(r"20\d{2}|\d{1,2}[./-]\d{1,2}", value))
+                if (parsed := parse_date(value)) is not None
+            })
             sheet_results.append(
                 {
                     "sheet_name": name,
@@ -340,6 +355,191 @@ def parse_date(value: Any) -> date | None:
     return None
 
 
+def infer_week_dates(worksheet, layout: dict[str, Any]) -> list[date] | None:
+    title_values = [
+        str(cell.value)
+        for row in worksheet.iter_rows(min_row=1, max_row=layout["header_end"], values_only=False)
+        for cell in row
+        if cell.value not in (None, "")
+    ]
+    title = " ".join(title_values)
+    full_dates = re.findall(r"(20\d{2})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})", title)
+    start: date | None = None
+    if full_dates:
+        year, month, day = map(int, full_dates[0])
+        try:
+            start = date(year, month, day)
+        except ValueError:
+            start = None
+    if start is None:
+        year_match = re.search(r"(20\d{2})", title)
+        range_match = re.search(r"(\d{1,2})[./-](\d{1,2})\s*(?:至|到|[-~—])\s*(\d{1,2})[./-](\d{1,2})", title)
+        if year_match and range_match:
+            try:
+                start = date(int(year_match.group(1)), int(range_match.group(1)), int(range_match.group(2)))
+            except ValueError:
+                start = None
+    header_dates: list[date] = []
+    for column in layout["daily"]:
+        parsed: date | None = None
+        day_number: int | None = None
+        for row_number in range(1, layout["header_end"] + 1):
+            value = worksheet.cell(row_number, column).value
+            if isinstance(value, (date, datetime)):
+                parsed = value.date() if isinstance(value, datetime) else value
+            elif isinstance(value, (int, float)) and 1 <= int(value) <= 31:
+                day_number = int(value)
+            elif isinstance(value, str):
+                parsed = parse_date(value)
+                day_match = re.fullmatch(r"\s*(\d{1,2})\s*(?:日|号)?\s*", value)
+                if day_match:
+                    day_number = int(day_match.group(1))
+            if parsed:
+                break
+        if parsed:
+            header_dates.append(parsed)
+        elif start and day_number:
+            month = start.month + (1 if day_number < start.day else 0)
+            year = start.year + (1 if month == 13 else 0)
+            month = 1 if month == 13 else month
+            try:
+                header_dates.append(date(year, month, day_number))
+            except ValueError:
+                return None
+        elif start:
+            header_dates.append(start.fromordinal(start.toordinal() + len(header_dates)))
+        else:
+            return None
+    return header_dates if len(header_dates) == 7 else None
+
+
+def iter_weekly_plan_rows(path: Path, batch: ImportBatch) -> Iterator[tuple[int, dict[str, Any], list[dict[str, Any]]]]:
+    sheet_name = batch.selected_sheet_name or ""
+    layout = WEEKLY_SHEET_LAYOUTS.get(sheet_name)
+    if layout is None:
+        raise ImportValidationError("WEEKLY_PLAN_SHEET_UNSUPPORTED", "周计划工作表必须为制管、包装、成型或下料")
+    options = batch.import_options or {}
+    include_hidden_rows = bool(options.get("include_hidden_rows", True))
+    workbook = load_safe_workbook(path)
+    try:
+        worksheet = workbook[sheet_name]
+        structure = extract_sheet_structure(path, worksheet)
+        merged_lookup = merged_cell_lookup(structure["merged_ranges"])
+        hidden_rows = structure["hidden_rows"]
+        week_dates = infer_week_dates(worksheet, layout)
+        master_cells: dict[tuple[int, int], Cell] = {}
+
+        def resolved_cell(row: tuple[Cell, ...], row_number: int, column: int | None) -> Cell | None:
+            if not column or column > len(row):
+                return None
+            cell = row[column - 1]
+            if cell.value in (None, ""):
+                master = merged_lookup.get((row_number, column))
+                if master:
+                    return master_cells.get(master, cell)
+            return cell
+
+        rows = list(worksheet.iter_rows(min_row=layout["header_end"] + 1))
+        for offset, row in enumerate(rows):
+            row_number = layout["header_end"] + 1 + offset
+            for column_number, cell in enumerate(row, start=1):
+                coordinate = (row_number, column_number)
+                if cell.value not in (None, "") and merged_lookup.get(coordinate, coordinate) == coordinate:
+                    master_cells[coordinate] = cell
+            row_kind_cell = resolved_cell(row, row_number, layout["row_kind"])
+            row_kind = str(row_kind_cell.value or "").strip()
+            if "计划" not in row_kind:
+                continue
+            source_row_hidden = row_number in hidden_rows
+            if source_row_hidden and not include_hidden_rows:
+                yield row_number, {}, [issue(row_number, "INFO", None, None, "HIDDEN_ROW_EXCLUDED", "用户选择仅导入可见行，该隐藏计划行已排除")]
+                continue
+            actual_row = rows[offset + 1] if offset + 1 < len(rows) else tuple()
+            actual_row_number = row_number + 1
+            actual_kind_cell = resolved_cell(actual_row, actual_row_number, layout["row_kind"]) if actual_row else None
+            has_actual_row = "实际" in str(actual_kind_cell.value or "")
+            problems: list[dict[str, Any]] = []
+            if not has_actual_row:
+                problems.append(issue(row_number, "WARNING", "row_kind", None, "WEEKLY_PLAN_ACTUAL_ROW_MISSING", "未找到配对实际行，计划仍进入待匹配区"))
+            if week_dates is None:
+                problems.append(issue(row_number, "ERROR", "plan_start_date", None, "WEEKLY_PLAN_PERIOD_UNRECOGNIZED", "无法从标题和日期表头识别七天计划周期"))
+            name = resolved_cell(row, row_number, layout["name"])
+            spec = resolved_cell(row, row_number, layout["spec"])
+            batch_cell = resolved_cell(row, row_number, layout["batch"])
+            process_cell = resolved_cell(row, row_number, layout["process"])
+            equipment_cell = resolved_cell(row, row_number, layout["equipment"])
+            production_batch_no = str(batch_cell.value).strip() if batch_cell and batch_cell.value not in (None, "") else None
+            process_name = str(process_cell.value).strip() if process_cell and process_cell.value not in (None, "") else sheet_name
+            equipment_name = str(equipment_cell.value).strip() if equipment_cell and equipment_cell.value not in (None, "") else sheet_name if sheet_name == "下料" else None
+            if not production_batch_no:
+                problems.append(issue(row_number, "ERROR", "production_batch_no", None, "WEEKLY_PLAN_BATCH_REQUIRED", "生产批次号缺失"))
+            if not equipment_name:
+                problems.append(issue(row_number, "WARNING", "equipment_name", None, "WEEKLY_PLAN_EQUIPMENT_MISSING", "设备为空，需在待匹配区确认"))
+            daily_plan: dict[str, str | None] = {}
+            daily_actual: dict[str, str | None] = {}
+            formula_metadata: dict[str, Any] = {"plan_formulas": {}, "actual_formulas": {}, "external_actual_formulas": {}}
+            for index, column in enumerate(layout["daily"]):
+                date_key = week_dates[index].isoformat() if week_dates else f"DAY_{index + 1}"
+                plan_cell = resolved_cell(row, row_number, column)
+                actual_cell = resolved_cell(actual_row, actual_row_number, column) if has_actual_row else None
+                plan_value = parse_decimal(plan_cell.value) if plan_cell and plan_cell.data_type != "f" else None
+                actual_value = parse_decimal(actual_cell.value) if actual_cell and actual_cell.data_type != "f" else None
+                daily_plan[date_key] = str(plan_value) if plan_value is not None else None
+                daily_actual[date_key] = str(actual_value) if actual_value is not None else None
+                if plan_cell and plan_cell.data_type == "f":
+                    formula_metadata["plan_formulas"][date_key] = str(plan_cell.value)
+                if actual_cell and actual_cell.data_type == "f":
+                    formula = str(actual_cell.value)
+                    if "[" in formula:
+                        formula_metadata["external_actual_formulas"][date_key] = formula
+                    else:
+                        formula_metadata["actual_formulas"][date_key] = formula
+            if formula_metadata["external_actual_formulas"]:
+                problems.append(issue(row_number, "WARNING", "daily_actual", None, "WEEKLY_ACTUAL_EXTERNAL_FORMULA", "实际量来自外部日报公式，未执行；计划量仍可进入待匹配区"))
+            weekly_plan = sum((Decimal(value) for value in daily_plan.values() if value is not None), Decimal("0"))
+            weekly_actual_values = [Decimal(value) for value in daily_actual.values() if value is not None]
+            weekly_actual = sum(weekly_actual_values, Decimal("0")) if weekly_actual_values else None
+            if weekly_plan == 0:
+                total_cell = resolved_cell(row, row_number, layout["total"])
+                if total_cell and total_cell.data_type != "f":
+                    weekly_plan = parse_decimal(total_cell.value) or Decimal("0")
+                elif total_cell and total_cell.data_type == "f":
+                    formula_metadata["weekly_plan_formula"] = str(total_cell.value)
+            if weekly_plan == 0:
+                problems.append(issue(row_number, "WARNING", "weekly_plan_qty", 0, "WEEKLY_PLAN_ZERO", "周计划数量为0，请人工确认"))
+            normalized = {
+                "_weekly_staging": True,
+                "product_name": str(name.value).strip() if name and name.value not in (None, "") else None,
+                "specification": str(spec.value).strip() if spec and spec.value not in (None, "") else None,
+                "production_batch_no": production_batch_no,
+                "process_name": process_name,
+                "equipment_name": equipment_name,
+                "plan_start_date": week_dates[0] if week_dates else None,
+                "plan_end_date": week_dates[-1] if week_dates else None,
+                "daily_plan": daily_plan,
+                "daily_actual": daily_actual,
+                "planned_quantity": weekly_plan,
+                "actual_quantity": weekly_actual,
+                "formula_metadata": formula_metadata,
+            }
+            normalized["raw_data"] = {
+                "source_row_hidden": source_row_hidden,
+                "plan_row_number": row_number,
+                "actual_row_number": actual_row_number if has_actual_row else None,
+                "product_name_raw": normalized["product_name"],
+                "specification_raw": normalized["specification"],
+                "production_batch_no": production_batch_no,
+                "process_name": process_name,
+                "equipment_name": equipment_name,
+                "daily_plan": daily_plan,
+                "daily_actual": daily_actual,
+                "formula_metadata": formula_metadata,
+            }
+            yield row_number, normalized, problems
+    finally:
+        workbook.close()
+
+
 def issue(row: int, severity: str, field: str | None, raw: Any, code: str, message: str) -> dict[str, Any]:
     return {
         "excel_row_number": row,
@@ -364,6 +564,9 @@ def iter_normalized_rows(
     sheet_name = batch.selected_sheet_name
     if not sheet_name:
         raise ImportValidationError("SHEET_REQUIRED", "请先选择工作表并完成分析")
+    if batch.import_type == "WEEKLY_PLAN":
+        yield from iter_weekly_plan_rows(path, batch)
+        return
     mapping = {key: int(value) for key, value in (batch.field_mapping or {}).items()}
     missing = sorted(REQUIRED_FIELDS[batch.import_type] - mapping.keys())
     if missing:
@@ -377,6 +580,7 @@ def iter_normalized_rows(
         worksheet = workbook[sheet_name]
         structure = extract_sheet_structure(path, worksheet)
         hidden_rows = structure["hidden_rows"]
+        include_hidden_rows = bool(options.get("include_hidden_rows", True))
         merged_lookup = merged_cell_lookup(structure["merged_ranges"])
         master_cells: dict[tuple[int, int], Cell] = {}
         header_end = int(options.get("header_row_end", 1))
@@ -387,7 +591,10 @@ def iter_normalized_rows(
                 coordinate = (row_number, column_number)
                 if cell.value not in (None, "") and merged_lookup.get(coordinate, coordinate) == coordinate:
                     master_cells[coordinate] = cell
-            if row_number in hidden_rows:
+            source_row_hidden = row_number in hidden_rows
+            if source_row_hidden and not include_hidden_rows:
+                if row_has_value(row):
+                    yield row_number, {}, [issue(row_number, "INFO", None, None, "HIDDEN_ROW_EXCLUDED", "用户选择仅导入可见行，该隐藏数据行已排除")]
                 continue
             if not row_has_value(row):
                 if seen_data:
@@ -449,6 +656,11 @@ def iter_normalized_rows(
                 source = normalized.get("source_available_qty")
                 if source is not None and source != calculated:
                     problems.append(issue(row_number, "WARNING", "source_available_qty", source, "AVAILABLE_QTY_MISMATCH", "Excel 可用量与系统复算值不一致"))
+            if batch.import_type in {"INVENTORY", "PIPE_WIP", "FITTING_WIP"}:
+                effective_snapshot_date = normalized.get("snapshot_date") or parse_date(options.get("source_date"))
+                normalized["snapshot_date"] = effective_snapshot_date
+                if effective_snapshot_date is None:
+                    problems.append(issue(row_number, "ERROR", "snapshot_date", None, "SNAPSHOT_DATE_REQUIRED", "Excel 快照日期和批次数据日期均为空"))
             if batch.import_type == "WEEKLY_PLAN" and normalized.get("plan_start_date") is None and normalized.get("plan_end_date") is None:
                 problems.append(issue(row_number, "ERROR", "plan_start_date", None, "WEEKLY_PLAN_PERIOD_UNRECOGNIZED", "计划周期无法识别"))
             normalized["raw_data"] = {
@@ -456,6 +668,7 @@ def iter_normalized_rows(
                 for field, value in normalized.items()
                 if field != "raw_data"
             }
+            normalized["raw_data"]["source_row_hidden"] = source_row_hidden
             yield row_number, normalized, problems
             if row_number >= MAX_SCAN_ROWS:
                 break
@@ -471,30 +684,52 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
     error_rows: set[int] = set()
     seen_keys: set[tuple[Any, ...]] = set()
     product_identity: dict[str, tuple[str | None, str | None]] = {}
+    existing_products: dict[str, Product | None] = {}
+    hidden_data_rows = 0
+    excluded_hidden_data_rows = 0
     weekly_plan_rows: dict[tuple[Any, ...], int] = {}
     weekly_actual_rows: dict[tuple[Any, ...], int] = {}
     issue_counts: Counter[str] = Counter()
     for row_number, normalized, problems in iter_normalized_rows(path, batch):
         if not normalized:
             for problem in problems:
+                if problem["issue_code"] == "HIDDEN_ROW_EXCLUDED":
+                    hidden_data_rows += 1
+                    excluded_hidden_data_rows += 1
+                issue_counts[problem["issue_code"]] += 1
                 db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
             continue
         total += 1
+        if normalized.get("raw_data", {}).get("source_row_hidden"):
+            hidden_data_rows += 1
         code = normalized.get("product_code")
         identity = (normalized.get("product_name"), normalized.get("specification"))
         if code and code in product_identity and product_identity[code] != identity:
             problems.append(issue(row_number, "WARNING", "product_code", code, "PRODUCT_IDENTITY_CONFLICT", "同一编码的名称或规格不一致"))
         elif code:
             product_identity[code] = identity
+        if code:
+            if code not in existing_products:
+                existing_products[code] = db.scalar(select(Product).where(Product.product_code == code))
+            existing_product = existing_products[code]
+            if existing_product:
+                conflict_fields = {
+                    "product_name": ("PRODUCT_MASTER_NAME_CONFLICT", existing_product.product_name),
+                    "specification": ("PRODUCT_MASTER_SPEC_CONFLICT", existing_product.specification),
+                    "category": ("PRODUCT_MASTER_CATEGORY_CONFLICT", existing_product.category),
+                    "unit": ("PRODUCT_MASTER_UNIT_CONFLICT", existing_product.unit),
+                }
+                for field, (conflict_code, database_value) in conflict_fields.items():
+                    excel_value = normalized.get(field)
+                    if excel_value not in (None, "") and database_value not in (None, "") and excel_value != database_value:
+                        raw_comparison = json.dumps({"excel_value": excel_value, "database_value": database_value}, ensure_ascii=False)
+                        problems.append(issue(row_number, "WARNING", field, raw_comparison, conflict_code, "导入值与现有产品主数据不一致，默认不会覆盖"))
         if batch.import_type == "SHIPMENT":
             key = (normalized.get("document_no"), code, normalized.get("shipment_date"), normalized.get("quantity"))
         elif batch.import_type == "FITTING_WIP":
             key = (code, normalized.get("production_batch_no"), normalized.get("quantity"))
         elif batch.import_type == "WEEKLY_PLAN":
-            pair_key = (code, normalized.get("production_batch_no"), normalized.get("process_name"), normalized.get("equipment_name"))
-            is_actual = "实际" in str(normalized.get("row_kind") or "")
-            (weekly_actual_rows if is_actual else weekly_plan_rows)[pair_key] = row_number
-            key = (*pair_key, "ACTUAL" if is_actual else "PLAN")
+            key = (normalized.get("product_name"), normalized.get("specification"), normalized.get("production_batch_no"), normalized.get("process_name"), row_number)
         else:
             key = (code,)
         if key in seen_keys:
@@ -510,7 +745,7 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
         for problem in problems:
             issue_counts[problem["issue_code"]] += 1
             db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
-    if batch.import_type == "WEEKLY_PLAN":
+    if batch.import_type == "WEEKLY_PLAN" and (weekly_plan_rows or weekly_actual_rows):
         unpaired = {**{key: row for key, row in weekly_plan_rows.items() if key not in weekly_actual_rows}, **{key: row for key, row in weekly_actual_rows.items() if key not in weekly_plan_rows}}
         for pair_key, row_number in unpaired.items():
             if row_number not in error_rows:
@@ -519,30 +754,65 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
             problem = issue(row_number, "ERROR", "row_kind", pair_key, "WEEKLY_PLAN_PAIR_MISSING", "计划行和实际行无法配对")
             issue_counts[problem["issue_code"]] += 1
             db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
+    if batch.import_type == "WEEKLY_PLAN" and (batch.import_options or {}).get("plan_period_consistent") is False:
+        warning_rows.add(0)
+        problem = issue(0, "WARNING", "plan_start_date", None, "WEEKLY_PLAN_PERIOD_MISMATCH", "工作簿内不同工作表的计划周期不一致，请分别确认")
+        issue_counts[problem["issue_code"]] += 1
+        db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
     batch.total_rows = total
     batch.valid_rows = valid
     batch.warning_rows = len(warning_rows)
     batch.error_rows = len(error_rows)
     batch.error_summary = dict(issue_counts)
+    batch.import_options = {
+        **(batch.import_options or {}),
+        "hidden_data_rows": hidden_data_rows,
+        "excluded_hidden_data_rows": excluded_hidden_data_rows,
+    }
     batch.status = "VALIDATION_FAILED" if error_rows else "READY"
     db.flush()
-    return {"total_rows": total, "valid_rows": valid, "warning_rows": len(warning_rows), "error_rows": len(error_rows), "status": batch.status}
+    return {"total_rows": total, "valid_rows": valid, "warning_rows": len(warning_rows), "error_rows": len(error_rows), "hidden_data_rows": hidden_data_rows, "excluded_hidden_data_rows": excluded_hidden_data_rows, "status": batch.status}
 
 
-def get_or_create_product(db: Session, normalized: dict[str, Any], import_type: str) -> Product:
+def get_or_create_product(
+    db: Session, normalized: dict[str, Any], batch: ImportBatch
+) -> tuple[Product, dict[str, Any] | None]:
     product = db.scalar(select(Product).where(Product.product_code == normalized["product_code"]))
+    incoming_fields = {
+        "product_name": normalized.get("product_name"),
+        "specification": normalized.get("specification"),
+        "category": normalized.get("category"),
+        "unit": normalized.get("unit"),
+    }
     if product is None:
         product = Product(
             product_code=normalized["product_code"],
-            product_name=normalized.get("product_name"),
-            specification=normalized.get("specification"),
-            category=normalized.get("category"),
-            unit=normalized.get("unit"),
-            data_source=import_type,
+            **incoming_fields,
+            data_source=batch.import_type,
+            last_import_batch_id=batch.id,
         )
         db.add(product)
         db.flush()
-    return product
+        return product, {"product_id": product.id, "before": None, "after": {"product_code": product.product_code, **incoming_fields}, "fields": list(incoming_fields)}
+    policy = str((batch.import_options or {}).get("master_data_policy", "FILL_EMPTY"))
+    before = {field: getattr(product, field) for field in incoming_fields}
+    changed_fields: list[str] = []
+    for field, incoming_value in incoming_fields.items():
+        if incoming_value in (None, ""):
+            continue
+        current_value = getattr(product, field)
+        if policy == "FILL_EMPTY" and current_value in (None, ""):
+            setattr(product, field, incoming_value)
+            changed_fields.append(field)
+        elif policy == "ADMIN_UPDATE" and current_value != incoming_value:
+            setattr(product, field, incoming_value)
+            changed_fields.append(field)
+    if changed_fields:
+        product.last_import_batch_id = batch.id
+        db.flush()
+        after = {field: getattr(product, field) for field in incoming_fields}
+        return product, {"product_id": product.id, "before": before, "after": after, "fields": changed_fields}
+    return product, None
 
 
 def build_record(batch: ImportBatch, row_number: int, normalized: dict[str, Any], product: Product):
@@ -563,17 +833,46 @@ def build_record(batch: ImportBatch, row_number: int, normalized: dict[str, Any]
         return FittingWipSnapshot(**common, snapshot_date=normalized.get("snapshot_date"), production_batch_no=normalized.get("production_batch_no"), quantity=normalized["quantity"])
     if batch.import_type == "REGULAR_PRODUCT":
         return RegularProductionProduct(**common)
-    return ImportedWeeklyPlanRaw(**common, production_batch_no=normalized["production_batch_no"], process_name=normalized["process_name"], equipment_name=normalized["equipment_name"], plan_start_date=normalized.get("plan_start_date"), plan_end_date=normalized.get("plan_end_date"), planned_quantity=normalized["planned_quantity"], actual_quantity=normalized.get("actual_quantity"))
+    return ImportedWeeklyPlanRaw(**common, production_batch_no=normalized["production_batch_no"], process_name=normalized["process_name"], equipment_name=normalized["equipment_name"], plan_start_date=normalized.get("plan_start_date"), plan_end_date=normalized.get("plan_end_date"), planned_quantity=normalized["planned_quantity"], actual_quantity=normalized.get("actual_quantity"), daily_plan=normalized.get("daily_plan", {}), daily_actual=normalized.get("daily_actual", {}))
 
 
-RECORD_MODELS = (ShipmentRecord, InventorySnapshot, PipeWipSnapshot, FittingWipSnapshot, RegularProductionProduct, ImportedWeeklyPlanRaw)
+RECORD_MODELS = (ShipmentRecord, InventorySnapshot, PipeWipSnapshot, FittingWipSnapshot, RegularProductionProduct, ImportedWeeklyPlanRaw, WeeklyPlanStagingRow)
 
 
-def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> int:
+def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> tuple[int, list[dict[str, Any]]]:
     if batch.status not in {"READY", "IMPORTING"} or batch.error_rows:
         raise ImportValidationError("IMPORT_NOT_READY", "批次存在错误或尚未完成校验")
     imported = 0
+    product_changes_by_id: dict[int, dict[str, Any]] = {}
     parsed_rows = list(iter_normalized_rows(path, batch))
+    if batch.import_type == "WEEKLY_PLAN":
+        for row_number, normalized, problems in parsed_rows:
+            if not normalized or any(item["severity"] == "ERROR" for item in problems):
+                continue
+            db.add(
+                WeeklyPlanStagingRow(
+                    import_batch_id=batch.id,
+                    source_sheet=batch.selected_sheet_name or "",
+                    source_row_number=row_number,
+                    raw_data=normalized["raw_data"],
+                    product_name_raw=normalized.get("product_name"),
+                    specification_raw=normalized.get("specification"),
+                    production_batch_no=normalized.get("production_batch_no"),
+                    process_name=normalized.get("process_name"),
+                    equipment_name=normalized.get("equipment_name"),
+                    plan_start_date=normalized["plan_start_date"],
+                    plan_end_date=normalized["plan_end_date"],
+                    daily_plan=normalized["daily_plan"],
+                    daily_actual=normalized["daily_actual"],
+                    weekly_plan_qty=normalized["planned_quantity"],
+                    weekly_actual_qty=normalized.get("actual_quantity"),
+                    formula_metadata=normalized["formula_metadata"],
+                    match_status="UNMATCHED",
+                )
+            )
+            imported += 1
+        db.flush()
+        return imported, []
     weekly_actual: dict[tuple[Any, ...], Decimal | None] = {}
     if batch.import_type == "WEEKLY_PLAN":
         for _, normalized, problems in parsed_rows:
@@ -588,11 +887,13 @@ def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> int:
                 continue
             key = (normalized.get("product_code"), normalized.get("production_batch_no"), normalized.get("process_name"), normalized.get("equipment_name"))
             normalized["actual_quantity"] = weekly_actual.get(key, normalized.get("actual_quantity"))
-        product = get_or_create_product(db, normalized, batch.import_type)
+        product, product_change = get_or_create_product(db, normalized, batch)
+        if product_change:
+            product_changes_by_id[product.id] = product_change
         db.add(build_record(batch, row_number, normalized, product))
         imported += 1
     db.flush()
-    return imported
+    return imported, list(product_changes_by_id.values())
 
 
 def delete_batch_records(db: Session, batch_id: int) -> None:

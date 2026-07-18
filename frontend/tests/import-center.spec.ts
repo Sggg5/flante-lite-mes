@@ -18,6 +18,8 @@ vi.mock('../src/api/imports', async (importOriginal) => {
     listImports: vi.fn().mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20 }),
     listImportIssues: vi.fn().mockResolvedValue({ items: [], total: 0 }),
     listImportAuditLogs: vi.fn().mockResolvedValue({ items: [] }),
+    listWeeklyPlanStaging: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+    searchProductCandidates: vi.fn().mockResolvedValue({ items: [] }),
   }
 })
 
@@ -32,8 +34,8 @@ function batch(overrides: Partial<ImportBatch> = {}): ImportBatch {
 }
 
 describe('Excel import center', () => {
-  it('defines the complete eight-step upload wizard', () => {
-    expect(WIZARD_STEPS).toEqual(['选择导入类型', '上传文件', '选择工作表', '字段匹配', '数据预览', '校验结果', '确认导入', '导入结果'])
+  it('defines the complete wizard including weekly plan matching', () => {
+    expect(WIZARD_STEPS).toEqual(['选择导入类型', '上传文件', '选择工作表', '字段匹配', '数据预览', '校验结果', '确认导入', '周计划待匹配', '导入结果'])
   })
 
   it('rejects conflicting field mappings', () => {

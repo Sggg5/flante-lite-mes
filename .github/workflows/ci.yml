@@ -127,6 +127,8 @@ jobs:
           sheet.title = "CI虚拟库存"
           sheet.append(["产品编码", "产品名称", "现存数量", "预计入库", "预计出库", "可用数量"])
           sheet.append(["TEST-PIPE-001", "CI虚拟水管", 10, 3, 2, 11])
+          sheet.append(["TEST-FITTING-001", "CI虚拟管件", 6, 1, 2, 5])
+          sheet.row_dimensions[3].hidden = True
           workbook.save("/tmp/ci-import.xlsx")
           PY
           docker compose cp backend:/tmp/ci-import.xlsx ./ci-import.xlsx
@@ -147,10 +149,10 @@ jobs:
             "http://localhost:8000/api/v1/imports/$batch_id/analyze" | jq -e '.status == "ANALYZED"'
           curl --fail --show-error -X POST \
             -H "Authorization: Bearer $token" \
-            "http://localhost:8000/api/v1/imports/$batch_id/validate" | jq -e '.status == "READY"'
+            "http://localhost:8000/api/v1/imports/$batch_id/validate" | jq -e '.status == "READY" and .source_date == "2026-07-18" and .hidden_data_rows == 1 and .excluded_hidden_data_rows == 0'
           curl --fail --show-error -X POST \
             -H "Authorization: Bearer $token" \
-            "http://localhost:8000/api/v1/imports/$batch_id/confirm" | jq -e '.status == "COMPLETED" and .imported_rows == 1'
+            "http://localhost:8000/api/v1/imports/$batch_id/confirm" | jq -e '.status == "COMPLETED" and .imported_rows == 2'
           curl --fail --show-error \
             -H "Authorization: Bearer $token" \
             "http://localhost:8000/api/v1/imports/$batch_id" | jq -e '.status == "COMPLETED"'

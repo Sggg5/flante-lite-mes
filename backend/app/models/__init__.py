@@ -9,6 +9,7 @@ from app.models.imports import (
     Product,
     RegularProductionProduct,
     ShipmentRecord,
+    WeeklyPlanStagingRow,
 )
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "Role",
     "RolePermission",
     "ShipmentRecord",
+    "WeeklyPlanStagingRow",
     "User",
     "UserRole",
 ]

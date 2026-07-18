@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,8 @@ from app.api.dependencies import require_permission
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.errors import error_payload
-from app.models import AuditLog, ImportBatch, ImportRowIssue, User
-from app.schemas.imports import AnalyzeImportRequest, RollbackImportRequest, UpdateMappingRequest
+from app.models import AuditLog, ImportBatch, ImportedWeeklyPlanRaw, ImportRowIssue, Product, User, WeeklyPlanStagingRow
+from app.schemas.imports import AnalyzeImportRequest, MatchWeeklyPlanRequest, RollbackImportRequest, UpdateImportOptionsRequest, UpdateMappingRequest
 from app.services.audit import write_audit_log
 from app.services.excel_import import (
     IMPORT_TYPES,
@@ -38,6 +39,16 @@ from app.services.identity import get_role_codes
 
 
 router = APIRouter(prefix="/api/v1/imports", tags=["imports"])
+
+
+def csv_safe_cell(value: Any) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    if value[0] in {"=", "+", "@"}:
+        return "'" + value
+    if value[0] == "-" and not re.fullmatch(r"-\d+(?:\.\d+)?", value.strip()):
+        return "'" + value
+    return value
 
 
 def raise_import_error(request: Request, exc: ImportValidationError, http_status: int = 422) -> None:
@@ -96,6 +107,11 @@ def serialize_batch(batch: ImportBatch) -> dict[str, Any]:
         "cancel_reason": batch.cancel_reason,
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
+        "source_date": (batch.import_options or {}).get("source_date"),
+        "include_hidden_rows": (batch.import_options or {}).get("include_hidden_rows", True),
+        "hidden_data_rows": (batch.import_options or {}).get("hidden_data_rows", 0),
+        "excluded_hidden_data_rows": (batch.import_options or {}).get("excluded_hidden_data_rows", 0),
+        "master_data_policy": (batch.import_options or {}).get("master_data_policy", "FILL_EMPTY"),
     }
 
 
@@ -105,6 +121,8 @@ async def upload_import(
     import_type: str = Form(...),
     file: UploadFile = File(...),
     source_date: date | None = Form(default=None),
+    include_hidden_rows: bool = Form(default=True),
+    master_data_policy: str = Form(default="FILL_EMPTY"),
     force: bool = Form(default=False),
     force_reason: str | None = Form(default=None),
     db: Session = Depends(get_db),
@@ -113,6 +131,8 @@ async def upload_import(
     normalized_type = import_type.strip().upper()
     if normalized_type not in IMPORT_TYPES:
         raise HTTPException(status_code=422, detail=error_payload(request, "IMPORT_TYPE_UNSUPPORTED", "不支持的导入类型"))
+    if master_data_policy not in {"KEEP_EXISTING", "FILL_EMPTY"}:
+        raise HTTPException(status_code=422, detail=error_payload(request, "MASTER_DATA_POLICY_INVALID", "上传阶段仅支持保留现有主数据或补充空字段；管理员覆盖请在批次选项中确认"))
     original_name = safe_filename(file.filename)
     if Path(original_name).suffix.lower() != ".xlsx":
         raise HTTPException(status_code=415, detail=error_payload(request, "XLSX_REQUIRED", "仅允许上传 .xlsx 文件"))
@@ -146,11 +166,11 @@ async def upload_import(
             batch_no=make_batch_no(), import_type=normalized_type, original_filename=original_name,
             stored_filename=stored_name, file_sha256=digest, file_size=size,
             workbook_sheet_count=sheet_count, status="UPLOADED", created_by=actor.id,
-            import_options={"source_date": source_date.isoformat() if source_date else None, "force": force, "force_reason": force_reason},
+            import_options={"source_date": source_date.isoformat() if source_date else None, "include_hidden_rows": include_hidden_rows, "master_data_policy": master_data_policy, "force": force, "force_reason": force_reason},
         )
         db.add(batch)
         db.flush()
-        write_audit_log(db, request, user=actor, action="import.upload", entity_type="import_batch", entity_id=str(batch.id), after_data={"batch_no": batch.batch_no, "import_type": normalized_type, "file_sha256": digest}, reason=force_reason)
+        write_audit_log(db, request, user=actor, action="import.upload", entity_type="import_batch", entity_id=str(batch.id), after_data={"batch_no": batch.batch_no, "import_type": normalized_type, "file_sha256": digest, "source_date": source_date.isoformat() if source_date else None, "include_hidden_rows": include_hidden_rows, "master_data_policy": master_data_policy}, reason=force_reason)
         db.commit()
     except ImportValidationError as exc:
         db.rollback()
@@ -209,7 +229,9 @@ def analyze_import(batch_id: int, payload: AnalyzeImportRequest, request: Reques
     if batch.status not in {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY"}:
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_STATE_INVALID", "当前批次状态不能重新分析"))
     try:
-        analysis = analyze_workbook(storage_path(batch), batch.import_type, payload.sheet_name)
+        path = storage_path(batch)
+        analysis = analyze_workbook(path, batch.import_type, payload.sheet_name)
+        workbook_analysis = analyze_workbook(path, batch.import_type) if batch.import_type == "WEEKLY_PLAN" else analysis
     except ImportValidationError as exc:
         raise_import_error(request, exc)
     sheet = analysis["sheets"][0]
@@ -217,7 +239,7 @@ def analyze_import(batch_id: int, payload: AnalyzeImportRequest, request: Reques
     header_end = payload.header_row_end or sheet["header_row_end"]
     batch.selected_sheet_name = payload.sheet_name
     batch.field_mapping = sheet["auto_mapping"]
-    batch.import_options = {**(batch.import_options or {}), "header_row_start": header_start, "header_row_end": header_end, "analysis": {key: sheet[key] for key in ("declared_rows", "last_row", "last_column", "formula_count", "external_formula_count", "error_cell_count", "scan_truncated")}}
+    batch.import_options = {**(batch.import_options or {}), "header_row_start": header_start, "header_row_end": header_end, "plan_period_consistent": workbook_analysis.get("plan_period_consistent", True), "sheet_periods": {item["sheet_name"]: [item.get("detected_date_start"), item.get("detected_date_end")] for item in workbook_analysis["sheets"]}, "analysis": {key: sheet[key] for key in ("declared_rows", "last_row", "last_column", "formula_count", "external_formula_count", "error_cell_count", "scan_truncated")}}
     batch.status = "ANALYZED"
     write_audit_log(db, request, user=actor, action="import.analyze", entity_type="import_batch", entity_id=str(batch.id), before_data=None, after_data={"sheet_name": payload.sheet_name, "header_row_start": header_start, "header_row_end": header_end, "field_mapping": batch.field_mapping})
     db.commit()
@@ -240,6 +262,33 @@ def update_mapping(batch_id: int, payload: UpdateMappingRequest, request: Reques
     batch.import_options = {**(batch.import_options or {}), "conversion_rules": payload.conversion_rules}
     batch.status = "ANALYZED"
     write_audit_log(db, request, user=actor, action="import.mapping.update", entity_type="import_batch", entity_id=str(batch.id), before_data={"field_mapping": before}, after_data={"field_mapping": payload.field_mapping, "conversion_rules": payload.conversion_rules})
+    db.commit()
+    return serialize_batch(batch)
+
+
+@router.put("/{batch_id}/options")
+def update_import_options(batch_id: int, payload: UpdateImportOptionsRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.validate"))) -> dict[str, Any]:
+    batch = get_batch_or_404(db, request, batch_id)
+    if batch.status not in {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY"}:
+        raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_OPTIONS_LOCKED", "当前批次状态不能修改导入选项"))
+    if payload.master_data_policy == "ADMIN_UPDATE":
+        if "ADMIN" not in get_role_codes(actor):
+            raise HTTPException(status_code=403, detail=error_payload(request, "ADMIN_MASTER_UPDATE_REQUIRED", "只有管理员可以覆盖产品主数据"))
+        if not payload.master_data_reason or len(payload.master_data_reason.strip()) < 2:
+            raise HTTPException(status_code=422, detail=error_payload(request, "MASTER_DATA_REASON_REQUIRED", "覆盖产品主数据必须填写原因"))
+    before = batch.import_options or {}
+    batch.import_options = {
+        **before,
+        "include_hidden_rows": payload.include_hidden_rows,
+        "source_date": payload.source_date.isoformat() if payload.source_date else None,
+        "master_data_policy": payload.master_data_policy,
+        "master_data_reason": payload.master_data_reason,
+        "hidden_data_rows": 0,
+        "excluded_hidden_data_rows": 0,
+    }
+    if batch.status in {"VALIDATION_FAILED", "READY"}:
+        batch.status = "ANALYZED"
+    write_audit_log(db, request, user=actor, action="import.options.update", entity_type="import_batch", entity_id=str(batch.id), before_data=before, after_data=batch.import_options, reason=payload.master_data_reason)
     db.commit()
     return serialize_batch(batch)
 
@@ -286,12 +335,14 @@ def confirm_import(batch_id: int, request: Request, db: Session = Depends(get_db
         path = storage_path(batch)
         batch.status = "IMPORTING"
         db.flush()
-        imported = import_validated_batch(db, batch, path)
+        imported, product_changes = import_validated_batch(db, batch, path)
         batch.status = "COMPLETED"
         batch.imported_rows = imported
         batch.confirmed_by = actor.id
         batch.confirmed_at = datetime.now(UTC)
         write_audit_log(db, request, user=actor, action="import.confirm", entity_type="import_batch", entity_id=str(batch.id), before_data={"status": "READY"}, after_data={"status": "COMPLETED", "imported_rows": imported})
+        for change in product_changes:
+            write_audit_log(db, request, user=actor, action="product.master_data.import", entity_type="product", entity_id=str(change["product_id"]), before_data=change["before"], after_data={**change["after"], "changed_fields": change["fields"], "import_batch_id": batch.id}, reason=(batch.import_options or {}).get("master_data_reason") or "按导入策略补充产品主数据")
         db.commit()
         return serialize_batch(batch)
     except ImportValidationError as exc:
@@ -344,9 +395,88 @@ def export_issues(batch_id: int, request: Request, db: Session = Depends(get_db)
     writer = csv.writer(output)
     writer.writerow(["工作表", "Excel行号", "严重程度", "字段", "原始值", "问题代码", "说明"])
     for item in items:
-        writer.writerow([item.sheet_name, item.excel_row_number, item.severity, item.field_name or "", item.raw_value or "", item.issue_code, item.message])
+        writer.writerow([csv_safe_cell(item.sheet_name), item.excel_row_number, item.severity, csv_safe_cell(item.field_name or ""), csv_safe_cell(item.raw_value or ""), item.issue_code, csv_safe_cell(item.message)])
     content = "\ufeff" + output.getvalue()
     return StreamingResponse(iter([content.encode("utf-8")]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{batch.batch_no}-issues.csv"'})
+
+
+@router.get("/{batch_id}/weekly-plan-staging")
+def list_weekly_plan_staging(batch_id: int, request: Request, page: int = Query(default=1, ge=1), page_size: int = Query(default=50, ge=1, le=200), match_status: str | None = None, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.view"))) -> dict[str, Any]:
+    batch = get_batch_or_404(db, request, batch_id)
+    if batch.import_type != "WEEKLY_PLAN":
+        raise HTTPException(status_code=422, detail=error_payload(request, "WEEKLY_PLAN_BATCH_REQUIRED", "该批次不是周计划导入"))
+    filters = [WeeklyPlanStagingRow.import_batch_id == batch_id]
+    if match_status:
+        filters.append(WeeklyPlanStagingRow.match_status == match_status.upper())
+    total = db.scalar(select(func.count(WeeklyPlanStagingRow.id)).where(*filters)) or 0
+    rows = db.scalars(select(WeeklyPlanStagingRow).where(*filters).order_by(WeeklyPlanStagingRow.source_row_number).offset((page - 1) * page_size).limit(page_size)).all()
+    return {"items": [serialize_weekly_staging(row) for row in rows], "page": page, "page_size": page_size, "total": total}
+
+
+def serialize_weekly_staging(row: WeeklyPlanStagingRow) -> dict[str, Any]:
+    return {
+        "id": row.id, "import_batch_id": row.import_batch_id, "source_sheet": row.source_sheet,
+        "source_row_number": row.source_row_number, "product_name_raw": row.product_name_raw,
+        "specification_raw": row.specification_raw, "production_batch_no": row.production_batch_no,
+        "process_name": row.process_name, "equipment_name": row.equipment_name,
+        "plan_start_date": row.plan_start_date, "plan_end_date": row.plan_end_date,
+        "daily_plan": row.daily_plan, "daily_actual": row.daily_actual,
+        "weekly_plan_qty": row.weekly_plan_qty, "weekly_actual_qty": row.weekly_actual_qty,
+        "formula_metadata": row.formula_metadata, "match_status": row.match_status,
+        "matched_product_id": row.matched_product_id, "matched_by": row.matched_by,
+        "matched_at": row.matched_at, "match_reason": row.match_reason,
+    }
+
+
+@router.get("/{batch_id}/product-candidates")
+def search_product_candidates(batch_id: int, request: Request, keyword: str = Query(min_length=1, max_length=100), limit: int = Query(default=20, ge=1, le=50), db: Session = Depends(get_db), actor: User = Depends(require_permission("import.view"))) -> dict[str, Any]:
+    batch = get_batch_or_404(db, request, batch_id)
+    if batch.import_type != "WEEKLY_PLAN":
+        raise HTTPException(status_code=422, detail=error_payload(request, "WEEKLY_PLAN_BATCH_REQUIRED", "该批次不是周计划导入"))
+    pattern = f"%{keyword.strip()}%"
+    products = db.scalars(select(Product).where(Product.is_active.is_(True), (Product.product_code.ilike(pattern) | Product.product_name.ilike(pattern) | Product.specification.ilike(pattern))).order_by(Product.product_code).limit(limit)).all()
+    return {"items": [{"id": product.id, "product_code": product.product_code, "product_name": product.product_name, "specification": product.specification, "category": product.category, "unit": product.unit} for product in products]}
+
+
+@router.post("/{batch_id}/weekly-plan-staging/{staging_id}/match")
+def match_weekly_plan_staging(batch_id: int, staging_id: int, payload: MatchWeeklyPlanRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.confirm"))) -> dict[str, Any]:
+    batch = get_batch_or_404(db, request, batch_id)
+    staging = db.scalar(select(WeeklyPlanStagingRow).where(WeeklyPlanStagingRow.id == staging_id, WeeklyPlanStagingRow.import_batch_id == batch_id))
+    if staging is None:
+        raise HTTPException(status_code=404, detail=error_payload(request, "WEEKLY_PLAN_STAGING_NOT_FOUND", "周计划待匹配记录不存在"))
+    before = {"match_status": staging.match_status, "matched_product_id": staging.matched_product_id}
+    if payload.action == "IGNORE":
+        raw_record = db.scalar(select(ImportedWeeklyPlanRaw).where(ImportedWeeklyPlanRaw.import_batch_id == batch_id, ImportedWeeklyPlanRaw.source_sheet == staging.source_sheet, ImportedWeeklyPlanRaw.source_row_number == staging.source_row_number))
+        if raw_record is not None:
+            db.delete(raw_record)
+        staging.match_status = "IGNORED"
+        staging.matched_product_id = None
+    else:
+        product = db.get(Product, payload.product_id)
+        if product is None or not product.is_active:
+            raise HTTPException(status_code=404, detail=error_payload(request, "PRODUCT_NOT_FOUND", "选择的产品不存在或已停用"))
+        raw_record = db.scalar(select(ImportedWeeklyPlanRaw).where(ImportedWeeklyPlanRaw.import_batch_id == batch_id, ImportedWeeklyPlanRaw.source_sheet == staging.source_sheet, ImportedWeeklyPlanRaw.source_row_number == staging.source_row_number))
+        if raw_record is None:
+            raw_record = ImportedWeeklyPlanRaw(
+                import_batch_id=batch_id, source_sheet=staging.source_sheet, source_row_number=staging.source_row_number,
+                raw_data=staging.raw_data, product_id=product.id, production_batch_no=staging.production_batch_no or "",
+                process_name=staging.process_name or "", equipment_name=staging.equipment_name or "",
+                plan_start_date=staging.plan_start_date, plan_end_date=staging.plan_end_date,
+                planned_quantity=staging.weekly_plan_qty, actual_quantity=staging.weekly_actual_qty,
+                daily_plan=staging.daily_plan, daily_actual=staging.daily_actual,
+            )
+            db.add(raw_record)
+        else:
+            raw_record.product_id = product.id
+        staging.match_status = "MATCHED"
+        staging.matched_product_id = product.id
+    staging.matched_by = actor.id
+    staging.matched_at = datetime.now(UTC)
+    staging.match_reason = payload.reason
+    after = {"match_status": staging.match_status, "matched_product_id": staging.matched_product_id}
+    write_audit_log(db, request, user=actor, action="weekly_plan.match", entity_type="weekly_plan_staging", entity_id=str(staging.id), before_data=before, after_data=after, reason=payload.reason)
+    db.commit()
+    return serialize_weekly_staging(staging)
 
 
 @router.get("/{batch_id}/audit-logs")

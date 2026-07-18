@@ -26,6 +26,11 @@ export interface ImportBatch {
   created_at: string
   confirmed_at: string | null
   cancel_reason: string | null
+  source_date?: string | null
+  include_hidden_rows?: boolean
+  hidden_data_rows?: number
+  excluded_hidden_data_rows?: number
+  master_data_policy?: string
   sheet_names?: string[]
 }
 
@@ -66,12 +71,18 @@ export async function listImports(params: Record<string, unknown> = {}) {
   return (await http.get<{ items: ImportBatch[]; total: number; page: number; page_size: number }>('/v1/imports', { params })).data
 }
 
-export async function uploadImport(importType: string, file: File, sourceDate?: string) {
+export async function uploadImport(importType: string, file: File, sourceDate?: string, includeHiddenRows = true, masterDataPolicy = 'FILL_EMPTY') {
   const form = new FormData()
   form.append('import_type', importType)
   form.append('file', file)
   if (sourceDate) form.append('source_date', sourceDate)
+  form.append('include_hidden_rows', String(includeHiddenRows))
+  form.append('master_data_policy', masterDataPolicy)
   return (await http.post<ImportBatch>('/v1/imports/upload', form)).data
+}
+
+export async function updateImportOptions(batchId: number, payload: { include_hidden_rows: boolean; source_date?: string; master_data_policy: string; master_data_reason?: string }) {
+  return (await http.put<ImportBatch>(`/v1/imports/${batchId}/options`, payload)).data
 }
 
 export async function getImport(batchId: number) {
@@ -112,6 +123,44 @@ export async function listImportIssues(batchId: number, severity?: string) {
 
 export async function listImportAuditLogs(batchId: number) {
   return (await http.get<{ items: ImportAuditLog[] }>(`/v1/imports/${batchId}/audit-logs`)).data
+}
+
+export interface WeeklyPlanStagingRow {
+  id: number
+  source_sheet: string
+  source_row_number: number
+  product_name_raw: string | null
+  specification_raw: string | null
+  production_batch_no: string | null
+  process_name: string | null
+  equipment_name: string | null
+  plan_start_date: string
+  plan_end_date: string
+  daily_plan: Record<string, string | null>
+  daily_actual: Record<string, string | null>
+  weekly_plan_qty: string
+  weekly_actual_qty: string | null
+  match_status: 'UNMATCHED' | 'SUGGESTED' | 'MATCHED' | 'CONFLICT' | 'IGNORED'
+  matched_product_id: number | null
+}
+
+export interface ProductCandidate {
+  id: number
+  product_code: string
+  product_name: string | null
+  specification: string | null
+}
+
+export async function listWeeklyPlanStaging(batchId: number) {
+  return (await http.get<{ items: WeeklyPlanStagingRow[]; total: number }>(`/v1/imports/${batchId}/weekly-plan-staging`)).data
+}
+
+export async function searchProductCandidates(batchId: number, keyword: string) {
+  return (await http.get<{ items: ProductCandidate[] }>(`/v1/imports/${batchId}/product-candidates`, { params: { keyword } })).data
+}
+
+export async function matchWeeklyPlanRow(batchId: number, stagingId: number, productId: number, reason: string) {
+  return (await http.post<WeeklyPlanStagingRow>(`/v1/imports/${batchId}/weekly-plan-staging/${stagingId}/match`, { action: 'MATCH', product_id: productId, reason })).data
 }
 
 export async function downloadImportIssues(batchId: number, batchNo: string) {

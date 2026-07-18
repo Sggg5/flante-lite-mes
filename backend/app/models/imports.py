@@ -70,6 +70,9 @@ class Product(Base, TimestampMixin):
     unit: Mapped[str | None] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(default=True)
     data_source: Mapped[str] = mapped_column(String(40), default="EXCEL_IMPORT")
+    last_import_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("import_batches.id", ondelete="SET NULL"), index=True
+    )
 
 
 class ImportedRecordMixin(TimestampMixin):
@@ -143,3 +146,28 @@ class ImportedWeeklyPlanRaw(Base, ImportedRecordMixin):
     plan_end_date: Mapped[date | None] = mapped_column(Date)
     planned_quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4))
     actual_quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    daily_plan: Mapped[dict[str, Any]] = mapped_column(JSON)
+    daily_actual: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class WeeklyPlanStagingRow(Base, ImportedRecordMixin):
+    __tablename__ = "weekly_plan_staging_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_name_raw: Mapped[str | None] = mapped_column(String(255))
+    specification_raw: Mapped[str | None] = mapped_column(String(255))
+    production_batch_no: Mapped[str | None] = mapped_column(String(100), index=True)
+    process_name: Mapped[str | None] = mapped_column(String(100))
+    equipment_name: Mapped[str | None] = mapped_column(String(100))
+    plan_start_date: Mapped[date] = mapped_column(Date, index=True)
+    plan_end_date: Mapped[date] = mapped_column(Date, index=True)
+    daily_plan: Mapped[dict[str, Any]] = mapped_column(JSON)
+    daily_actual: Mapped[dict[str, Any]] = mapped_column(JSON)
+    weekly_plan_qty: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    weekly_actual_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    formula_metadata: Mapped[dict[str, Any]] = mapped_column(JSON)
+    match_status: Mapped[str] = mapped_column(String(20), index=True, default="UNMATCHED")
+    matched_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), index=True)
+    matched_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    match_reason: Mapped[str | None] = mapped_column(Text)

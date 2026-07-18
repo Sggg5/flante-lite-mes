@@ -4,8 +4,10 @@ import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
 
 import {
   IMPORT_TYPE_LABELS, analyzeImport, confirmImport, downloadImportIssues, getImportPreview, getImportSheets,
-  listImportAuditLogs, listImportIssues, listImports, rollbackImport, updateImportMapping,
-  uploadImport, validateImport, type ImportAuditLog, type ImportBatch, type ImportIssue, type PreviewRow,
+  listImportAuditLogs, listImportIssues, listImports, listWeeklyPlanStaging, matchWeeklyPlanRow,
+  rollbackImport, searchProductCandidates, updateImportMapping, uploadImport, validateImport,
+  type ImportAuditLog, type ImportBatch, type ImportIssue, type PreviewRow, type ProductCandidate,
+  type WeeklyPlanStagingRow,
 } from '../api/imports'
 import { useAuthStore } from '../stores/auth'
 import { WIZARD_STEPS, previewRowClass } from './import-workflow'
@@ -19,6 +21,8 @@ const wizardVisible = ref(false)
 const wizardStep = ref(0)
 const uploadType = ref('INVENTORY')
 const sourceDate = ref('')
+const includeHiddenRows = ref(true)
+const masterDataPolicy = ref('FILL_EMPTY')
 const selectedFile = ref<File | null>(null)
 const currentBatch = ref<ImportBatch | null>(null)
 const sheetNames = ref<string[]>([])
@@ -30,6 +34,9 @@ const detailVisible = ref(false)
 const detailBatch = ref<ImportBatch | null>(null)
 const detailIssues = ref<ImportIssue[]>([])
 const detailAuditLogs = ref<ImportAuditLog[]>([])
+const weeklyStagingRows = ref<WeeklyPlanStagingRow[]>([])
+const productCandidates = ref<ProductCandidate[]>([])
+const weeklyMatches = reactive<Record<number, { productId?: number; reason: string }>>({})
 
 const canUpload = computed(() => auth.hasPermission('import.upload'))
 const canValidate = computed(() => auth.hasPermission('import.validate'))
@@ -67,6 +74,8 @@ function startWizard() {
   wizardStep.value = 0
   uploadType.value = 'INVENTORY'
   sourceDate.value = ''
+  includeHiddenRows.value = true
+  masterDataPolicy.value = 'FILL_EMPTY'
   selectedFile.value = null
   currentBatch.value = null
   sheetNames.value = []
@@ -87,7 +96,7 @@ async function nextWizardStep() {
   }
   if (wizardStep.value === 1) {
     if (!selectedFile.value) return ElMessage.warning('请选择 .xlsx 文件')
-    currentBatch.value = await uploadImport(uploadType.value, selectedFile.value, sourceDate.value || undefined)
+    currentBatch.value = await uploadImport(uploadType.value, selectedFile.value, sourceDate.value || undefined, includeHiddenRows.value, masterDataPolicy.value)
     const sheets = await getImportSheets(currentBatch.value.id)
     sheetNames.value = sheets.sheet_names
     selectedSheet.value = sheetNames.value[0] ?? ''
@@ -121,9 +130,33 @@ async function nextWizardStep() {
   if (wizardStep.value === 6) {
     if (!currentBatch.value || currentBatch.value.error_rows > 0) return ElMessage.error('存在错误行，不能确认导入')
     currentBatch.value = await confirmImport(currentBatch.value.id)
-    wizardStep.value = 7
+    if (currentBatch.value.import_type === 'WEEKLY_PLAN') {
+      weeklyStagingRows.value = (await listWeeklyPlanStaging(currentBatch.value.id)).items
+      weeklyStagingRows.value.forEach((row) => { weeklyMatches[row.id] = { reason: '人工确认周计划产品匹配' } })
+      wizardStep.value = 7
+    } else {
+      wizardStep.value = 8
+    }
     await refresh()
+    return
   }
+  if (wizardStep.value === 7) {
+    wizardStep.value = 8
+  }
+}
+
+async function searchCandidates(keyword: string) {
+  if (!currentBatch.value || !keyword.trim()) return
+  productCandidates.value = (await searchProductCandidates(currentBatch.value.id, keyword)).items
+}
+
+async function confirmWeeklyMatch(row: WeeklyPlanStagingRow) {
+  if (!currentBatch.value) return
+  const selection = weeklyMatches[row.id]
+  if (!selection?.productId) return ElMessage.warning('请选择产品编码')
+  const updated = await matchWeeklyPlanRow(currentBatch.value.id, row.id, selection.productId, selection.reason)
+  weeklyStagingRows.value = weeklyStagingRows.value.map((item) => item.id === row.id ? updated : item)
+  ElMessage.success('周计划产品匹配已确认')
 }
 
 async function applyPreviewFilter() {
@@ -188,19 +221,20 @@ onMounted(refresh)
       <el-steps :active="wizardStep" finish-status="success" align-center><el-step v-for="step in WIZARD_STEPS" :key="step" :title="step" /></el-steps>
       <div class="wizard-panel">
         <div v-if="wizardStep === 0"><h3>选择导入类型</h3><el-radio-group v-model="uploadType"><el-radio-button v-for="(label, value) in IMPORT_TYPE_LABELS" :key="value" :value="value">{{ label }}</el-radio-button></el-radio-group></div>
-        <div v-else-if="wizardStep === 1"><h3>上传文件</h3><el-date-picker v-model="sourceDate" value-format="YYYY-MM-DD" placeholder="数据日期（可选）" /><el-upload :auto-upload="false" accept=".xlsx" :limit="1" :on-change="chooseFile"><el-button>选择 .xlsx 文件</el-button></el-upload></div>
+        <div v-else-if="wizardStep === 1"><h3>上传文件</h3><el-form label-width="150px"><el-form-item label="数据日期"><el-date-picker v-model="sourceDate" value-format="YYYY-MM-DD" placeholder="库存/在制快照日期" /></el-form-item><el-form-item label="隐藏行策略"><el-switch v-model="includeHiddenRows" active-text="导入所有物理行（默认）" inactive-text="仅导入可见行" /></el-form-item><el-form-item label="产品主数据策略"><el-select v-model="masterDataPolicy" style="width:280px"><el-option label="用导入值补充空字段（默认）" value="FILL_EMPTY" /><el-option label="完全保留现有主数据" value="KEEP_EXISTING" /></el-select></el-form-item><el-form-item label="Excel文件"><el-upload :auto-upload="false" accept=".xlsx" :limit="1" :on-change="chooseFile"><el-button>选择 .xlsx 文件</el-button></el-upload></el-form-item></el-form></div>
         <div v-else-if="wizardStep === 2"><h3>选择工作表</h3><el-select v-model="selectedSheet" style="width: 320px"><el-option v-for="sheet in sheetNames" :key="sheet" :label="sheet" :value="sheet" /></el-select></div>
         <div v-else-if="wizardStep === 3" data-testid="field-mapping"><h3>字段匹配</h3><p>列号从 1 开始；每个 Excel 列只能映射一次。</p><el-row :gutter="16"><el-col v-for="(_, field) in mapping" :key="field" :span="8"><el-form-item :label="field"><el-input-number v-model="mapping[field]" :min="1" /></el-form-item></el-col></el-row></div>
         <div v-else-if="wizardStep === 4" data-testid="preview-table"><div class="preview-tools"><h3>数据预览（最多100行）</h3><el-radio-group v-model="previewFilter" @change="applyPreviewFilter"><el-radio-button value="">全部</el-radio-button><el-radio-button value="ERROR">只看错误</el-radio-button><el-radio-button value="WARNING">只看警告</el-radio-button></el-radio-group></div><el-table :data="previewRows" max-height="430" :row-class-name="tableRowClassName"><el-table-column prop="excel_row_number" label="Excel行号" width="100" fixed /><el-table-column v-for="column in previewColumns" :key="column" :prop="`data.${column}`" :label="column" min-width="150" :fixed="['product_code','product_name','specification'].includes(column) ? 'left' : false" /></el-table></div>
         <div v-else-if="wizardStep === 5"><h3>执行全量校验</h3><el-alert title="校验不会写入正式业务表" type="info" show-icon /></div>
         <div v-else-if="wizardStep === 6" data-testid="confirm-import"><h3>确认导入</h3><el-descriptions v-if="currentBatch" border :column="4"><el-descriptions-item label="有效行">{{ currentBatch.valid_rows }}</el-descriptions-item><el-descriptions-item label="警告行">{{ currentBatch.warning_rows }}</el-descriptions-item><el-descriptions-item label="错误行">{{ currentBatch.error_rows }}</el-descriptions-item><el-descriptions-item label="状态">{{ currentBatch.status }}</el-descriptions-item></el-descriptions><el-alert v-if="currentBatch?.warning_rows" title="警告行默认允许导入，请确认后继续" type="warning" show-icon /></div>
+        <div v-else-if="wizardStep === 7" data-testid="weekly-plan-staging"><h3>周计划待匹配</h3><el-alert title="真实周计划没有产品编码。名称和规格只用于搜索候选，必须人工确认后才生成标准化周计划记录。" type="warning" show-icon /><el-table :data="weeklyStagingRows" max-height="420"><el-table-column prop="source_row_number" label="Excel行" width="80" /><el-table-column prop="product_name_raw" label="产品名称原值" min-width="150" /><el-table-column prop="specification_raw" label="规格原值" min-width="130" /><el-table-column prop="production_batch_no" label="批次" width="130" /><el-table-column prop="process_name" label="工序" width="90" /><el-table-column prop="weekly_plan_qty" label="周计划" width="90" /><el-table-column prop="match_status" label="匹配状态" width="110" /><el-table-column label="人工匹配" min-width="330"><template #default="scope"><div class="match-controls"><el-select v-model="weeklyMatches[scope.row.id].productId" filterable remote :remote-method="searchCandidates" placeholder="按编码、名称或规格搜索"><el-option v-for="candidate in productCandidates" :key="candidate.id" :value="candidate.id" :label="`${candidate.product_code} · ${candidate.product_name ?? ''} · ${candidate.specification ?? ''}`" /></el-select><el-button type="primary" :disabled="scope.row.match_status === 'MATCHED'" @click="confirmWeeklyMatch(scope.row)">确认</el-button></div></template></el-table-column></el-table></div>
         <el-result v-else icon="success" title="导入完成" :sub-title="`已导入 ${currentBatch?.imported_rows ?? 0} 行`" />
       </div>
-      <template #footer><el-button @click="wizardVisible = false">关闭</el-button><el-button v-if="wizardStep < 7" type="primary" :disabled="(wizardStep === 5 && !canValidate) || (wizardStep === 6 && !canConfirm)" @click="nextWizardStep">{{ wizardStep === 6 ? '确认导入' : '下一步' }}</el-button></template>
+      <template #footer><el-button @click="wizardVisible = false">关闭</el-button><el-button v-if="wizardStep < 8" type="primary" :disabled="(wizardStep === 5 && !canValidate) || (wizardStep === 6 && !canConfirm)" @click="nextWizardStep">{{ wizardStep === 6 ? '确认导入' : wizardStep === 7 ? '完成匹配' : '下一步' }}</el-button></template>
     </el-dialog>
 
     <el-drawer v-model="detailVisible" size="58%" title="导入批次详情" data-testid="batch-detail">
-      <template v-if="detailBatch"><el-descriptions border :column="2"><el-descriptions-item label="批次号">{{ detailBatch.batch_no }}</el-descriptions-item><el-descriptions-item label="状态">{{ detailBatch.status }}</el-descriptions-item><el-descriptions-item label="文件">{{ detailBatch.original_filename }}</el-descriptions-item><el-descriptions-item label="SHA-256"><code>{{ detailBatch.file_sha256 }}</code></el-descriptions-item><el-descriptions-item label="工作表">{{ detailBatch.selected_sheet_name }}</el-descriptions-item><el-descriptions-item label="统计">有效 {{ detailBatch.valid_rows }} / 警告 {{ detailBatch.warning_rows }} / 错误 {{ detailBatch.error_rows }}</el-descriptions-item></el-descriptions><h3>字段映射</h3><pre>{{ JSON.stringify(detailBatch.field_mapping, null, 2) }}</pre><div class="detail-actions"><el-button link type="primary" @click="exportIssues">下载错误明细</el-button><el-button v-if="canRollback && detailBatch.status === 'COMPLETED'" type="danger" plain @click="rollbackBatch">撤销批次</el-button></div><h3>错误与警告</h3><el-table :data="detailIssues"><el-table-column prop="excel_row_number" label="行号" width="80" /><el-table-column prop="severity" label="等级" width="90" /><el-table-column prop="field_name" label="字段" width="140" /><el-table-column prop="message" label="说明" /></el-table><h3>操作日志</h3><el-table :data="detailAuditLogs"><el-table-column prop="occurred_at" label="时间" width="185" /><el-table-column prop="action" label="动作" width="180" /><el-table-column prop="user_id" label="操作人ID" width="100" /><el-table-column prop="reason" label="原因" /><el-table-column prop="request_id" label="请求编号" min-width="220" /></el-table></template>
+      <template v-if="detailBatch"><el-descriptions border :column="2"><el-descriptions-item label="批次号">{{ detailBatch.batch_no }}</el-descriptions-item><el-descriptions-item label="状态">{{ detailBatch.status }}</el-descriptions-item><el-descriptions-item label="文件">{{ detailBatch.original_filename }}</el-descriptions-item><el-descriptions-item label="SHA-256"><code>{{ detailBatch.file_sha256 }}</code></el-descriptions-item><el-descriptions-item label="工作表">{{ detailBatch.selected_sheet_name }}</el-descriptions-item><el-descriptions-item label="数据日期">{{ detailBatch.source_date || '未设置' }}</el-descriptions-item><el-descriptions-item label="隐藏行策略">{{ detailBatch.include_hidden_rows ? '导入所有物理行' : '仅导入可见行' }}</el-descriptions-item><el-descriptions-item label="隐藏数据统计">共 {{ detailBatch.hidden_data_rows ?? 0 }} 行 / 排除 {{ detailBatch.excluded_hidden_data_rows ?? 0 }} 行</el-descriptions-item><el-descriptions-item label="主数据策略">{{ detailBatch.master_data_policy }}</el-descriptions-item><el-descriptions-item label="统计">有效 {{ detailBatch.valid_rows }} / 警告 {{ detailBatch.warning_rows }} / 错误 {{ detailBatch.error_rows }}</el-descriptions-item></el-descriptions><h3>字段映射</h3><pre>{{ JSON.stringify(detailBatch.field_mapping, null, 2) }}</pre><div class="detail-actions"><el-button link type="primary" @click="exportIssues">下载错误明细</el-button><el-button v-if="canRollback && detailBatch.status === 'COMPLETED'" type="danger" plain @click="rollbackBatch">撤销批次</el-button></div><h3>错误与警告</h3><el-table :data="detailIssues"><el-table-column prop="excel_row_number" label="行号" width="80" /><el-table-column prop="severity" label="等级" width="90" /><el-table-column prop="field_name" label="字段" width="140" /><el-table-column prop="message" label="说明" /></el-table><h3>操作日志</h3><el-table :data="detailAuditLogs"><el-table-column prop="occurred_at" label="时间" width="185" /><el-table-column prop="action" label="动作" width="180" /><el-table-column prop="user_id" label="操作人ID" width="100" /><el-table-column prop="reason" label="原因" /><el-table-column prop="request_id" label="请求编号" min-width="220" /></el-table></template>
     </el-drawer>
   </section>
 </template>
@@ -212,6 +246,7 @@ onMounted(refresh)
 .batch-card :deep(.el-pagination) { margin-top:18px; justify-content:flex-end; }
 .wizard-panel { min-height:450px; padding:34px 10px 10px; }.wizard-panel h3 { margin-top:0; }
 .preview-tools,.detail-actions { display:flex; justify-content:space-between; align-items:center; }
+.match-controls { display:flex; gap:8px; }.match-controls .el-select { flex:1; }
 :deep(.preview-error td) { background:#fff1f0 !important; }:deep(.preview-warning td) { background:#fff7e6 !important; }
 pre { padding:14px; overflow:auto; background:#f5f7f5; border:1px solid #dce3dc; } code { word-break:break-all; }
 </style>

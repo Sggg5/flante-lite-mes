@@ -1,6 +1,6 @@
 import type { ImportBatch, PreviewRow } from '../api/imports'
 
-export const WIZARD_STEPS = ['选择导入类型', '上传文件', '选择工作表', '字段匹配', '数据预览', '校验结果', '确认导入', '导入结果']
+export const WIZARD_STEPS = ['选择导入类型', '上传文件', '选择工作表', '字段匹配', '数据预览', '校验结果', '确认导入', '周计划待匹配', '导入结果']
 
 export function mappingColumnsAreUnique(mapping: Record<string, number>) {
   const columns = Object.values(mapping)
