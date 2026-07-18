@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from io import BytesIO
+from pathlib import Path
 from threading import Event, Lock
 from time import sleep
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from app.api.routes import imports as import_routes
 from app.core.config import get_settings
+from app.core.database import engine
 from app.core.security import hash_password
-from app.models import AuditLog, ImportBatch, ImportedWeeklyPlanRaw, ImportRowIssue, InventorySnapshot, PipeWipSnapshot, Product, ProductImportChange, RegularProductionProduct, Role, User, UserRole, WeeklyPlanStagingRow
+from app.models import AuditLog, ImportBatch, ImportedWeeklyPlanRaw, ImportRowIssue, InventorySnapshot, PipeWipSnapshot, Product, ProductImportChange, RegularProductionProduct, Role, ShipmentRecord, User, UserRole, WeeklyPlanStagingRow
 
 
 def workbook_bytes(headers, rows, *, sheet_name="数据", extra_sheet=False, multiline=False, trailing_style_row=None):
@@ -115,6 +118,32 @@ def test_non_xlsx_and_oversized_files_are_rejected(client, admin_token, monkeypa
     too_large = upload(client, admin_token, b"x", filename="large.xlsx")
     assert too_large.status_code == 413
     assert too_large.json()["code"] == "IMPORT_FILE_TOO_LARGE"
+
+
+def test_streamed_upload_keeps_exact_sha256_and_no_temporary_file(client, db, admin_token):
+    content, _ = workbook_bytes(["产品编码"], [["SYNTHETIC-STREAM-001"]])
+    response = upload(client, admin_token, content, import_type="REGULAR_PRODUCT")
+    assert response.status_code == 201
+    assert response.json()["file_sha256"] == hashlib.sha256(content).hexdigest()
+    batch = db.get(ImportBatch, response.json()["id"])
+    stored_path = get_settings().import_storage_dir
+    assert (Path(stored_path) / batch.stored_filename).read_bytes() == content
+    assert not list(Path(stored_path).glob(".upload-*.tmp.xlsx"))
+
+
+def test_oversized_stream_stops_and_removes_temporary_file(client, admin_token, monkeypatch):
+    monkeypatch.setattr(get_settings(), "import_max_file_size_mb", 0)
+    response = upload(client, admin_token, b"x" * (1024 * 1024 + 7))
+    assert response.status_code == 413
+    assert response.json()["code"] == "IMPORT_FILE_TOO_LARGE"
+    assert not list(Path(get_settings().import_storage_dir).glob(".upload-*.tmp.xlsx"))
+
+
+def test_invalid_workbook_removes_temporary_file(client, admin_token):
+    response = upload(client, admin_token, b"PK-not-a-valid-workbook")
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_WORKBOOK"
+    assert not list(Path(get_settings().import_storage_dir).glob(".upload-*.tmp.xlsx"))
 
 
 def test_duplicate_file_is_blocked_and_admin_may_force_with_reason(client, admin_token):
@@ -580,6 +609,100 @@ def test_issue_csv_escapes_formula_prefixes_but_preserves_negative_numbers_and_u
     assert "'@IMPORT" in text
     assert "-12.5" in text and "'-12.5" not in text
     assert "中文测试" in text
+
+
+def test_file_integrity_is_checked_before_analysis_validation_and_confirmation(client, db, admin_token):
+    def corrupt(batch_id: int) -> None:
+        batch = db.get(ImportBatch, batch_id)
+        path = Path(get_settings().import_storage_dir) / batch.stored_filename
+        with path.open("ab") as target:
+            target.write(b"external-change")
+
+    content, _ = workbook_bytes(["产品编码"], [["SYNTHETIC-INTEGRITY-A"]])
+    analysis_batch = upload(client, admin_token, content, import_type="REGULAR_PRODUCT").json()["id"]
+    corrupt(analysis_batch)
+    response = analyze(client, admin_token, analysis_batch)
+    assert response.status_code == 422
+    assert response.json()["code"] == "IMPORT_FILE_INTEGRITY_FAILED"
+
+    content, _ = workbook_bytes(["产品编码"], [["SYNTHETIC-INTEGRITY-B"]])
+    validation_batch = upload(client, admin_token, content, import_type="REGULAR_PRODUCT").json()["id"]
+    assert analyze(client, admin_token, validation_batch).status_code == 200
+    corrupt(validation_batch)
+    response = validate(client, admin_token, validation_batch)
+    assert response.status_code == 422
+    assert response.json()["code"] == "IMPORT_FILE_INTEGRITY_FAILED"
+
+    content, _ = workbook_bytes(["产品编码"], [["SYNTHETIC-INTEGRITY-C"]])
+    confirmation_batch = upload(client, admin_token, content, import_type="REGULAR_PRODUCT").json()["id"]
+    assert analyze(client, admin_token, confirmation_batch).status_code == 200
+    assert validate(client, admin_token, confirmation_batch).json()["status"] == "READY"
+    corrupt(confirmation_batch)
+    response = client.post(f"/api/v1/imports/{confirmation_batch}/confirm", headers={"Authorization": f"Bearer {admin_token}"})
+    assert response.status_code == 409
+    assert response.json()["code"] == "IMPORT_FILE_INTEGRITY_FAILED"
+    assert db.scalar(select(func.count(RegularProductionProduct.id)).where(RegularProductionProduct.import_batch_id == confirmation_batch)) == 0
+
+
+def test_ten_thousand_rows_use_bounded_product_queries_and_one_master_change(client, db, admin_token):
+    rows = [
+        ["SYNTHETIC-BULK-001", "虚拟批量产品", f"SYNTHETIC-DOC-{index:05d}", "2026-07-18", 1]
+        for index in range(10_000)
+    ]
+    content, _ = workbook_bytes(["产品编码", "产品名称", "出库单号", "出库日期", "出库数量"], rows)
+    batch_id = upload(client, admin_token, content, import_type="SHIPMENT").json()["id"]
+    assert analyze(client, admin_token, batch_id).status_code == 200
+    checked = validate(client, admin_token, batch_id)
+    assert checked.json()["status"] == "READY"
+    assert checked.json()["valid_rows"] == 10_000
+
+    product_selects = 0
+
+    def count_product_selects(_connection, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal product_selects
+        normalized_statement = " ".join(statement.lower().split())
+        if normalized_statement.startswith("select") and " from products" in normalized_statement:
+            product_selects += 1
+
+    event.listen(engine, "before_cursor_execute", count_product_selects)
+    try:
+        response = client.post(f"/api/v1/imports/{batch_id}/confirm", headers={"Authorization": f"Bearer {admin_token}"})
+    finally:
+        event.remove(engine, "before_cursor_execute", count_product_selects)
+    assert response.status_code == 200, response.text
+    assert response.json()["imported_rows"] == 10_000
+    assert product_selects <= 2
+    assert db.scalar(select(func.count(Product.id)).where(Product.product_code == "SYNTHETIC-BULK-001")) == 1
+    product = db.scalar(select(Product).where(Product.product_code == "SYNTHETIC-BULK-001"))
+    assert db.scalar(select(func.count(ProductImportChange.id)).where(ProductImportChange.import_batch_id == batch_id, ProductImportChange.product_id == product.id)) == 1
+    assert db.scalar(select(func.count(ShipmentRecord.id)).where(ShipmentRecord.import_batch_id == batch_id)) == 10_000
+
+
+def test_rolled_back_weekly_batch_cannot_match_and_leaves_no_raw_record(client, db, admin_token):
+    content = realistic_weekly_plan_workbook()
+    batch_id = upload(client, admin_token, content, import_type="WEEKLY_PLAN").json()["id"]
+    assert analyze(client, admin_token, batch_id, sheet_name="制管").status_code == 200
+    assert validate(client, admin_token, batch_id).json()["status"] == "READY"
+    assert client.post(f"/api/v1/imports/{batch_id}/confirm", headers={"Authorization": f"Bearer {admin_token}"}).status_code == 200
+    staging = db.scalar(select(WeeklyPlanStagingRow).where(WeeklyPlanStagingRow.import_batch_id == batch_id))
+    staging_id = staging.id
+    product = Product(product_code="SYNTHETIC-WEEKLY-MATCH", product_name="虚拟周计划产品", data_source="TEST")
+    db.add(product)
+    db.commit()
+    rolled_back = client.post(
+        f"/api/v1/imports/{batch_id}/rollback",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"reason": "验证撤销与匹配互斥"},
+    )
+    assert rolled_back.status_code == 200
+    response = client.post(
+        f"/api/v1/imports/{batch_id}/weekly-plan-staging/{staging_id}/match",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"action": "MATCH", "product_id": product.id, "reason": "撤销后不得匹配"},
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "IMPORT_STATE_INVALID"
+    assert db.scalar(select(func.count(ImportedWeeklyPlanRaw.id)).where(ImportedWeeklyPlanRaw.import_batch_id == batch_id)) == 0
 
 
 def analyzed_regular_batch(client, token, *, code="TEST-STATE-001"):

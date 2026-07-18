@@ -1,4 +1,21 @@
+import axios from 'axios'
+
 import http from './http'
+
+export const IMPORT_REQUEST_TIMEOUT_MS = 600_000
+
+export function describeImportError(error: unknown): string {
+  if (!axios.isAxiosError(error)) return '后端处理失败，请查看批次状态或联系管理员'
+  if (error.response?.status === 413 || error.response?.data?.code === 'IMPORT_FILE_TOO_LARGE') {
+    return '文件过大，上传文件不得超过 64MB'
+  }
+  if (error.code === 'ECONNABORTED') {
+    return '网络请求超时；后端可能仍在处理，请刷新批次列表确认状态后再操作'
+  }
+  if (!error.response) return '网络连接超时或中断，后端可能仍在处理，请稍后刷新批次状态'
+  const backendMessage = error.response.data?.message ?? error.response.data?.detail?.message
+  return backendMessage ? `后端处理失败：${backendMessage}` : '后端处理失败，请查看批次详情中的错误信息'
+}
 
 export type ImportStatus =
   | 'UPLOADED' | 'ANALYZED' | 'VALIDATION_FAILED' | 'READY'
@@ -71,18 +88,23 @@ export async function listImports(params: Record<string, unknown> = {}) {
   return (await http.get<{ items: ImportBatch[]; total: number; page: number; page_size: number }>('/v1/imports', { params })).data
 }
 
-export async function uploadImport(importType: string, file: File, sourceDate?: string, includeHiddenRows = true, masterDataPolicy = 'FILL_EMPTY') {
+export async function uploadImport(importType: string, file: File, sourceDate?: string, includeHiddenRows = true, masterDataPolicy = 'FILL_EMPTY', onProgress?: (percent: number) => void) {
   const form = new FormData()
   form.append('import_type', importType)
   form.append('file', file)
   if (sourceDate) form.append('source_date', sourceDate)
   form.append('include_hidden_rows', String(includeHiddenRows))
   form.append('master_data_policy', masterDataPolicy)
-  return (await http.post<ImportBatch>('/v1/imports/upload', form)).data
+  return (await http.post<ImportBatch>('/v1/imports/upload', form, {
+    timeout: IMPORT_REQUEST_TIMEOUT_MS,
+    onUploadProgress: (event) => {
+      if (event.total) onProgress?.(Math.min(100, Math.round((event.loaded / event.total) * 100)))
+    },
+  })).data
 }
 
 export async function updateImportOptions(batchId: number, payload: { include_hidden_rows: boolean; source_date?: string; master_data_policy: string; master_data_reason?: string; force_duplicate?: boolean; force_reason?: string }) {
-  return (await http.put<ImportBatch>(`/v1/imports/${batchId}/options`, payload)).data
+  return (await http.put<ImportBatch>(`/v1/imports/${batchId}/options`, payload, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function getImport(batchId: number) {
@@ -90,27 +112,27 @@ export async function getImport(batchId: number) {
 }
 
 export async function getImportSheets(batchId: number) {
-  return (await http.get<{ sheet_names: string[]; sheets: Array<Record<string, unknown>> }>(`/v1/imports/${batchId}/sheets`)).data
+  return (await http.get<{ sheet_names: string[]; sheets: Array<Record<string, unknown>> }>(`/v1/imports/${batchId}/sheets`, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function analyzeImport(batchId: number, sheetName: string) {
-  return (await http.post<ImportBatch & { analysis: Record<string, unknown> }>(`/v1/imports/${batchId}/analyze`, { sheet_name: sheetName })).data
+  return (await http.post<ImportBatch & { analysis: Record<string, unknown> }>(`/v1/imports/${batchId}/analyze`, { sheet_name: sheetName }, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function updateImportMapping(batchId: number, fieldMapping: Record<string, number>) {
-  return (await http.put<ImportBatch>(`/v1/imports/${batchId}/mapping`, { field_mapping: fieldMapping, conversion_rules: {} })).data
+  return (await http.put<ImportBatch>(`/v1/imports/${batchId}/mapping`, { field_mapping: fieldMapping, conversion_rules: {} }, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function getImportPreview(batchId: number, issueFilter?: string) {
-  return (await http.get<{ items: PreviewRow[] }>(`/v1/imports/${batchId}/preview`, { params: { issue_filter: issueFilter || undefined, limit: 100 } })).data
+  return (await http.get<{ items: PreviewRow[] }>(`/v1/imports/${batchId}/preview`, { params: { issue_filter: issueFilter || undefined, limit: 100 }, timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function validateImport(batchId: number) {
-  return (await http.post<ImportBatch>(`/v1/imports/${batchId}/validate`)).data
+  return (await http.post<ImportBatch>(`/v1/imports/${batchId}/validate`, undefined, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function confirmImport(batchId: number) {
-  return (await http.post<ImportBatch>(`/v1/imports/${batchId}/confirm`)).data
+  return (await http.post<ImportBatch>(`/v1/imports/${batchId}/confirm`, undefined, { timeout: IMPORT_REQUEST_TIMEOUT_MS })).data
 }
 
 export async function rollbackImport(batchId: number, reason: string) {

@@ -15,7 +15,7 @@ from openpyxl.cell import Cell
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.utils.datetime import from_excel
 from xml.etree.ElementTree import iterparse
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -43,6 +43,7 @@ IMPORT_TYPES = {
 }
 EMPTY_ROW_STOP = 200
 MAX_SCAN_ROWS = 500_000
+DATABASE_WRITE_CHUNK_SIZE = 2_000
 SCIENCE_PATTERN = re.compile(r"^[+-]?\d+(?:\.\d+)?[Ee][+-]?\d+$")
 
 FIELD_SYNONYMS: dict[str, tuple[str, ...]] = {
@@ -110,8 +111,12 @@ def safe_filename(filename: str | None) -> str:
     return (cleaned or "upload.xlsx")[:255]
 
 
-def sha256_bytes(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def make_batch_no() -> str:
@@ -745,10 +750,27 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
     error_rows: set[int] = set()
     seen_keys: set[tuple[Any, ...]] = set()
     product_identity: dict[str, tuple[str | None, str | None]] = {}
-    existing_products: dict[str, Product | None] = {}
+    # One bounded query replaces one query per distinct product code. The current
+    # product catalogue is intentionally small enough (~20k rows) to keep in memory.
+    existing_products = {
+        product.product_code: product for product in db.scalars(select(Product)).all()
+    }
+    issue_buffer: list[dict[str, Any]] = []
     hidden_data_rows = 0
     excluded_hidden_data_rows = 0
     issue_counts: Counter[str] = Counter()
+    def queue_problem(problem: dict[str, Any]) -> None:
+        issue_buffer.append(
+            {
+                "import_batch_id": batch.id,
+                "sheet_name": batch.selected_sheet_name or "",
+                **problem,
+            }
+        )
+        if len(issue_buffer) >= DATABASE_WRITE_CHUNK_SIZE:
+            db.execute(insert(ImportRowIssue), issue_buffer)
+            issue_buffer.clear()
+
     for row_number, normalized, problems in iter_normalized_rows(path, batch):
         if not normalized:
             for problem in problems:
@@ -756,7 +778,7 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
                     hidden_data_rows += 1
                     excluded_hidden_data_rows += 1
                 issue_counts[problem["issue_code"]] += 1
-                db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
+                queue_problem(problem)
             continue
         total += 1
         raw_data = normalized.get("raw_data", {})
@@ -773,9 +795,7 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
         elif code:
             product_identity[code] = identity
         if code:
-            if code not in existing_products:
-                existing_products[code] = db.scalar(select(Product).where(Product.product_code == code))
-            existing_product = existing_products[code]
+            existing_product = existing_products.get(code)
             if existing_product:
                 conflict_fields = {
                     "product_name": ("PRODUCT_MASTER_NAME_CONFLICT", existing_product.product_name),
@@ -808,12 +828,15 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
             warning_rows.add(row_number)
         for problem in problems:
             issue_counts[problem["issue_code"]] += 1
-            db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
+            queue_problem(problem)
     if batch.import_type == "WEEKLY_PLAN" and (batch.import_options or {}).get("plan_period_consistent") is False:
         warning_rows.add(0)
         problem = issue(0, "WARNING", "plan_start_date", None, "WEEKLY_PLAN_PERIOD_MISMATCH", "工作簿内不同工作表的计划周期不一致，请分别确认")
         issue_counts[problem["issue_code"]] += 1
-        db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
+        queue_problem(problem)
+    if issue_buffer:
+        db.execute(insert(ImportRowIssue), issue_buffer)
+        issue_buffer.clear()
     batch.total_rows = total
     batch.valid_rows = valid
     batch.warning_rows = len(warning_rows)
@@ -830,9 +853,14 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
 
 
 def get_or_create_product(
-    db: Session, normalized: dict[str, Any], batch: ImportBatch
+    db: Session,
+    normalized: dict[str, Any],
+    batch: ImportBatch,
+    products_by_code: dict[str, Product],
+    locked_product_ids: set[int],
 ) -> tuple[Product, dict[str, Any] | None]:
-    product = db.scalar(select(Product).where(Product.product_code == normalized["product_code"]).with_for_update())
+    product_code = normalized["product_code"]
+    product = products_by_code.get(product_code)
     incoming_fields = {
         "product_name": normalized.get("product_name"),
         "specification": normalized.get("specification"),
@@ -847,16 +875,31 @@ def get_or_create_product(
             last_import_batch_id=batch.id,
         )
         db.add(product)
-        db.flush()
+        products_by_code[product_code] = product
         created_fields = ["product_code", *[field for field, value in incoming_fields.items() if value not in (None, "")]]
         return product, {
-            "product_id": product.id,
+            "product_id": None,
             "change_type": "CREATED",
             "before": None,
             "after": {"product_code": product.product_code, **incoming_fields, "last_import_batch_id": batch.id},
             "fields": created_fields,
         }
     policy = str((batch.import_options or {}).get("master_data_policy", "FILL_EMPTY"))
+    requires_change = any(
+        incoming_value not in (None, "")
+        and (
+            (policy == "FILL_EMPTY" and getattr(product, field) in (None, ""))
+            or (policy == "ADMIN_UPDATE" and getattr(product, field) != incoming_value)
+        )
+        for field, incoming_value in incoming_fields.items()
+    )
+    if requires_change and product.id is not None and product.id not in locked_product_ids:
+        locked = db.scalar(select(Product).where(Product.id == product.id).with_for_update())
+        if locked is None:
+            raise ImportValidationError("PRODUCT_NOT_FOUND", "产品主数据在确认期间已被删除")
+        product = locked
+        products_by_code[product_code] = product
+        locked_product_ids.add(product.id)
     before = {**{field: getattr(product, field) for field in incoming_fields}, "last_import_batch_id": product.last_import_batch_id}
     changed_fields: list[str] = []
     for field, incoming_value in incoming_fields.items():
@@ -871,7 +914,6 @@ def get_or_create_product(
             changed_fields.append(field)
     if changed_fields:
         product.last_import_batch_id = batch.id
-        db.flush()
         after = {**{field: getattr(product, field) for field in incoming_fields}, "last_import_batch_id": product.last_import_batch_id}
         return product, {
             "product_id": product.id,
@@ -883,7 +925,7 @@ def get_or_create_product(
     return product, None
 
 
-def build_record(batch: ImportBatch, row_number: int, normalized: dict[str, Any], product: Product):
+def build_record_values(batch: ImportBatch, row_number: int, normalized: dict[str, Any], product: Product) -> tuple[type, dict[str, Any]]:
     common = {
         "import_batch_id": batch.id,
         "source_sheet": batch.selected_sheet_name or "",
@@ -892,16 +934,16 @@ def build_record(batch: ImportBatch, row_number: int, normalized: dict[str, Any]
         "product_id": product.id,
     }
     if batch.import_type == "SHIPMENT":
-        return ShipmentRecord(**common, document_no=normalized["document_no"], shipment_date=normalized["shipment_date"], shipment_month=normalized.get("shipment_month"), quantity=normalized["quantity"], production_batch_no=normalized.get("production_batch_no"))
+        return ShipmentRecord, {**common, "document_no": normalized["document_no"], "shipment_date": normalized["shipment_date"], "shipment_month": normalized.get("shipment_month"), "quantity": normalized["quantity"], "production_batch_no": normalized.get("production_batch_no")}
     if batch.import_type == "INVENTORY":
-        return InventorySnapshot(**common, snapshot_date=normalized.get("snapshot_date"), on_hand_qty=normalized["on_hand_qty"], expected_inbound_qty=normalized["expected_inbound_qty"], expected_outbound_qty=normalized["expected_outbound_qty"], source_available_qty=normalized.get("source_available_qty"), calculated_available_qty=normalized["calculated_available_qty"])
+        return InventorySnapshot, {**common, "snapshot_date": normalized.get("snapshot_date"), "on_hand_qty": normalized["on_hand_qty"], "expected_inbound_qty": normalized["expected_inbound_qty"], "expected_outbound_qty": normalized["expected_outbound_qty"], "source_available_qty": normalized.get("source_available_qty"), "calculated_available_qty": normalized["calculated_available_qty"]}
     if batch.import_type == "PIPE_WIP":
-        return PipeWipSnapshot(**common, snapshot_date=normalized.get("snapshot_date"), quantity=normalized["quantity"])
+        return PipeWipSnapshot, {**common, "snapshot_date": normalized.get("snapshot_date"), "quantity": normalized["quantity"]}
     if batch.import_type == "FITTING_WIP":
-        return FittingWipSnapshot(**common, snapshot_date=normalized.get("snapshot_date"), production_batch_no=normalized.get("production_batch_no"), quantity=normalized["quantity"])
+        return FittingWipSnapshot, {**common, "snapshot_date": normalized.get("snapshot_date"), "production_batch_no": normalized.get("production_batch_no"), "quantity": normalized["quantity"]}
     if batch.import_type == "REGULAR_PRODUCT":
-        return RegularProductionProduct(**common)
-    return ImportedWeeklyPlanRaw(**common, production_batch_no=normalized["production_batch_no"], process_name=normalized["process_name"], equipment_name=normalized["equipment_name"], plan_start_date=normalized.get("plan_start_date"), plan_end_date=normalized.get("plan_end_date"), planned_quantity=normalized["planned_quantity"], actual_quantity=normalized.get("actual_quantity"), daily_plan=normalized.get("daily_plan", {}), daily_actual=normalized.get("daily_actual", {}))
+        return RegularProductionProduct, common
+    return ImportedWeeklyPlanRaw, {**common, "production_batch_no": normalized["production_batch_no"], "process_name": normalized["process_name"], "equipment_name": normalized["equipment_name"], "plan_start_date": normalized.get("plan_start_date"), "plan_end_date": normalized.get("plan_end_date"), "planned_quantity": normalized["planned_quantity"], "actual_quantity": normalized.get("actual_quantity"), "daily_plan": normalized.get("daily_plan", {}), "daily_actual": normalized.get("daily_actual", {})}
 
 
 RECORD_MODELS = (ShipmentRecord, InventorySnapshot, PipeWipSnapshot, FittingWipSnapshot, RegularProductionProduct, ImportedWeeklyPlanRaw, WeeklyPlanStagingRow)
@@ -912,52 +954,74 @@ def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> tuple
     if batch.status != "IMPORTING" or batch.error_rows:
         raise ImportValidationError("IMPORT_VALIDATION_REQUIRED", "批次未通过全量校验或未由确认接口锁定")
     imported = 0
-    product_changes_by_id: dict[int, dict[str, Any]] = {}
-    parsed_rows = list(iter_normalized_rows(path, batch))
+    product_changes_by_code: dict[str, dict[str, Any]] = {}
     if batch.import_type == "WEEKLY_PLAN":
-        for row_number, normalized, problems in parsed_rows:
+        staging_buffer: list[dict[str, Any]] = []
+        for row_number, normalized, problems in iter_normalized_rows(path, batch):
             if not normalized or any(item["severity"] == "ERROR" for item in problems):
                 continue
-            db.add(
-                WeeklyPlanStagingRow(
-                    import_batch_id=batch.id,
-                    source_sheet=batch.selected_sheet_name or "",
-                    source_row_number=row_number,
-                    raw_data=normalized["raw_data"],
-                    product_name_raw=normalized.get("product_name"),
-                    specification_raw=normalized.get("specification"),
-                    production_batch_no=normalized.get("production_batch_no"),
-                    process_name=normalized.get("process_name"),
-                    equipment_name=normalized.get("equipment_name"),
-                    plan_start_date=normalized["plan_start_date"],
-                    plan_end_date=normalized["plan_end_date"],
-                    daily_plan=normalized["daily_plan"],
-                    daily_actual=normalized["daily_actual"],
-                    weekly_plan_qty=normalized["planned_quantity"],
-                    weekly_actual_qty=normalized.get("actual_quantity"),
-                    formula_metadata=normalized["formula_metadata"],
-                    match_status="UNMATCHED",
-                )
-            )
+            staging_buffer.append({
+                "import_batch_id": batch.id, "source_sheet": batch.selected_sheet_name or "",
+                "source_row_number": row_number, "raw_data": normalized["raw_data"],
+                "product_name_raw": normalized.get("product_name"), "specification_raw": normalized.get("specification"),
+                "production_batch_no": normalized.get("production_batch_no"), "process_name": normalized.get("process_name"),
+                "equipment_name": normalized.get("equipment_name"), "plan_start_date": normalized["plan_start_date"],
+                "plan_end_date": normalized["plan_end_date"], "daily_plan": normalized["daily_plan"],
+                "daily_actual": normalized["daily_actual"], "weekly_plan_qty": normalized["planned_quantity"],
+                "weekly_actual_qty": normalized.get("actual_quantity"), "formula_metadata": normalized["formula_metadata"],
+                "match_status": "UNMATCHED",
+            })
             imported += 1
-        db.flush()
+            if len(staging_buffer) >= DATABASE_WRITE_CHUNK_SIZE:
+                db.execute(insert(WeeklyPlanStagingRow), staging_buffer)
+                staging_buffer.clear()
+        if staging_buffer:
+            db.execute(insert(WeeklyPlanStagingRow), staging_buffer)
+        if imported != batch.valid_rows:
+            raise ImportValidationError("IMPORT_ROW_COUNT_MISMATCH", "确认导入行数与全量校验有效行数不一致")
         return imported, []
-    for row_number, normalized, problems in parsed_rows:
+
+    products_by_code = {product.product_code: product for product in db.scalars(select(Product)).all()}
+    locked_product_ids: set[int] = set()
+    record_model = {
+        "SHIPMENT": ShipmentRecord, "INVENTORY": InventorySnapshot, "PIPE_WIP": PipeWipSnapshot,
+        "FITTING_WIP": FittingWipSnapshot, "REGULAR_PRODUCT": RegularProductionProduct,
+    }[batch.import_type]
+    record_buffer: list[tuple[int, dict[str, Any], Product]] = []
+
+    def flush_records() -> None:
+        if not record_buffer:
+            return
+        # Flush only assigns/updates product rows. Business rows use Core bulk insert,
+        # so hundreds of thousands of ORM instances never accumulate in the identity map.
+        db.flush()
+        values = [build_record_values(batch, row_number, normalized, product)[1] for row_number, normalized, product in record_buffer]
+        db.execute(insert(record_model), values)
+        record_buffer.clear()
+
+    for row_number, normalized, problems in iter_normalized_rows(path, batch):
         if not normalized or any(item["severity"] == "ERROR" for item in problems):
             continue
-        product, product_change = get_or_create_product(db, normalized, batch)
+        product, product_change = get_or_create_product(db, normalized, batch, products_by_code, locked_product_ids)
         if product_change:
-            existing_change = product_changes_by_id.get(product.id)
+            product_code = product.product_code
+            existing_change = product_changes_by_code.get(product_code)
             if existing_change is None:
-                product_changes_by_id[product.id] = product_change
+                product_changes_by_code[product_code] = product_change
             else:
                 existing_change["after"] = product_change["after"]
                 existing_change["fields"] = list(dict.fromkeys([*existing_change["fields"], *product_change["fields"]]))
                 if existing_change["change_type"] != "CREATED" and product_change["change_type"] == "ADMIN_UPDATED":
                     existing_change["change_type"] = "ADMIN_UPDATED"
-        db.add(build_record(batch, row_number, normalized, product))
+        record_buffer.append((row_number, normalized, product))
         imported += 1
-    for product_change in product_changes_by_id.values():
+        if len(record_buffer) >= DATABASE_WRITE_CHUNK_SIZE:
+            flush_records()
+    flush_records()
+    if imported != batch.valid_rows:
+        raise ImportValidationError("IMPORT_ROW_COUNT_MISMATCH", "确认导入行数与全量校验有效行数不一致")
+    for product_code, product_change in product_changes_by_code.items():
+        product_change["product_id"] = products_by_code[product_code].id
         db.add(
             ProductImportChange(
                 import_batch_id=batch.id,
@@ -969,7 +1033,7 @@ def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> tuple
             )
         )
     db.flush()
-    return imported, list(product_changes_by_id.values())
+    return imported, list(product_changes_by_code.values())
 
 
 def delete_batch_records(db: Session, batch_id: int) -> None:
@@ -1000,9 +1064,36 @@ def rollback_product_import_changes(db: Session, batch: ImportBatch) -> list[dic
         .order_by(ProductImportChange.id.desc())
         .with_for_update()
     ).all()
+    product_ids = [change.product_id for change in changes if change.product_id is not None]
+    products_by_id: dict[int, Product] = {}
+    referenced_product_ids: set[int] = set()
+    # Chunk IN predicates to remain portable across SQLite and PostgreSQL bind limits.
+    for offset in range(0, len(product_ids), 500):
+        id_chunk = product_ids[offset:offset + 500]
+        products_by_id.update({
+            product.id: product
+            for product in db.scalars(select(Product).where(Product.id.in_(id_chunk)).with_for_update()).all()
+        })
+        for model in PRODUCT_REFERENCE_MODELS:
+            referenced_product_ids.update(
+                db.scalars(
+                    select(model.product_id).where(
+                        model.product_id.in_(id_chunk), model.import_batch_id != batch.id
+                    ).distinct()
+                ).all()
+            )
+        referenced_product_ids.update(
+            db.scalars(
+                select(WeeklyPlanStagingRow.matched_product_id).where(
+                    WeeklyPlanStagingRow.matched_product_id.in_(id_chunk),
+                    WeeklyPlanStagingRow.import_batch_id != batch.id,
+                ).distinct()
+            ).all()
+        )
+
     pending: list[tuple[ProductImportChange, Product]] = []
     for change in changes:
-        product = db.scalar(select(Product).where(Product.id == change.product_id).with_for_update()) if change.product_id is not None else None
+        product = products_by_id.get(change.product_id) if change.product_id is not None else None
         if product is None:
             raise ImportValidationError(
                 "PRODUCT_MASTER_ROLLBACK_CONFLICT",
@@ -1010,7 +1101,7 @@ def rollback_product_import_changes(db: Session, batch: ImportBatch) -> list[dic
                 {"change_id": change.id},
             )
         if change.change_type == "CREATED":
-            if product.last_import_batch_id != batch.id or _product_has_other_batch_references(db, product.id, batch.id):
+            if product.last_import_batch_id != batch.id or product.id in referenced_product_ids:
                 raise ImportValidationError(
                     "PRODUCT_MASTER_ROLLBACK_CONFLICT",
                     "当前批次新建的产品已被后续批次或其他数据引用，不能撤销",

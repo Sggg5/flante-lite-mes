@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
 
 import {
-  IMPORT_TYPE_LABELS, analyzeImport, confirmImport, downloadImportIssues, getImportPreview, getImportSheets,
+  IMPORT_TYPE_LABELS, analyzeImport, confirmImport, describeImportError, downloadImportIssues, getImportPreview, getImportSheets,
   listImportAuditLogs, listImportIssues, listImports, listWeeklyPlanStaging, matchWeeklyPlanRow,
   rollbackImport, searchProductCandidates, updateImportMapping, uploadImport, validateImport,
   type ImportAuditLog, type ImportBatch, type ImportIssue, type PreviewRow, type ProductCandidate,
@@ -14,6 +14,8 @@ import { WIZARD_STEPS, previewRowClass } from './import-workflow'
 
 const auth = useAuthStore()
 const loading = ref(false)
+const importProcessing = ref(false)
+const uploadProgress = ref(0)
 const batches = ref<ImportBatch[]>([])
 const total = ref(0)
 const filters = reactive({ import_type: '', status: '', page: 1, page_size: 20 })
@@ -71,6 +73,8 @@ async function refresh() {
 }
 
 function startWizard() {
+  importProcessing.value = false
+  uploadProgress.value = 0
   wizardStep.value = 0
   uploadType.value = 'INVENTORY'
   sourceDate.value = ''
@@ -89,14 +93,15 @@ function chooseFile(file: UploadFile) {
   selectedFile.value = file.raw ?? null
 }
 
-async function nextWizardStep() {
+async function advanceWizardStep() {
   if (wizardStep.value === 0) {
     wizardStep.value = 1
     return
   }
   if (wizardStep.value === 1) {
     if (!selectedFile.value) return ElMessage.warning('请选择 .xlsx 文件')
-    currentBatch.value = await uploadImport(uploadType.value, selectedFile.value, sourceDate.value || undefined, includeHiddenRows.value, masterDataPolicy.value)
+    uploadProgress.value = 0
+    currentBatch.value = await uploadImport(uploadType.value, selectedFile.value, sourceDate.value || undefined, includeHiddenRows.value, masterDataPolicy.value, (percent) => { uploadProgress.value = percent })
     const sheets = await getImportSheets(currentBatch.value.id)
     sheetNames.value = sheets.sheet_names
     selectedSheet.value = sheetNames.value[0] ?? ''
@@ -142,6 +147,18 @@ async function nextWizardStep() {
   }
   if (wizardStep.value === 7) {
     wizardStep.value = 8
+  }
+}
+
+async function nextWizardStep() {
+  if (importProcessing.value) return
+  importProcessing.value = true
+  try {
+    await advanceWizardStep()
+  } catch (error) {
+    ElMessage.error(describeImportError(error))
+  } finally {
+    importProcessing.value = false
   }
 }
 
@@ -221,7 +238,7 @@ onMounted(refresh)
       <el-steps :active="wizardStep" finish-status="success" align-center><el-step v-for="step in WIZARD_STEPS" :key="step" :title="step" /></el-steps>
       <div class="wizard-panel">
         <div v-if="wizardStep === 0"><h3>选择导入类型</h3><el-radio-group v-model="uploadType"><el-radio-button v-for="(label, value) in IMPORT_TYPE_LABELS" :key="value" :value="value">{{ label }}</el-radio-button></el-radio-group></div>
-        <div v-else-if="wizardStep === 1"><h3>上传文件</h3><el-form label-width="150px"><el-form-item label="数据日期"><el-date-picker v-model="sourceDate" value-format="YYYY-MM-DD" placeholder="库存/在制快照日期" /></el-form-item><el-form-item label="隐藏行策略"><el-switch v-model="includeHiddenRows" active-text="导入所有物理行（默认）" inactive-text="仅导入可见行" /></el-form-item><el-form-item label="产品主数据策略"><el-select v-model="masterDataPolicy" style="width:280px"><el-option label="用导入值补充空字段（默认）" value="FILL_EMPTY" /><el-option label="完全保留现有主数据" value="KEEP_EXISTING" /></el-select></el-form-item><el-form-item label="Excel文件"><el-upload :auto-upload="false" accept=".xlsx" :limit="1" :on-change="chooseFile"><el-button>选择 .xlsx 文件</el-button></el-upload></el-form-item></el-form></div>
+        <div v-else-if="wizardStep === 1"><h3>上传文件</h3><el-alert v-if="importProcessing" :title="uploadProgress < 100 ? `正在上传：${uploadProgress}%` : '上传完成，后端正在验证工作簿，请勿关闭窗口'" type="info" show-icon :closable="false" /><el-progress v-if="importProcessing" :percentage="uploadProgress" :indeterminate="uploadProgress >= 100" /><el-form label-width="150px"><el-form-item label="数据日期"><el-date-picker v-model="sourceDate" value-format="YYYY-MM-DD" placeholder="库存/在制快照日期" /></el-form-item><el-form-item label="隐藏行策略"><el-switch v-model="includeHiddenRows" active-text="导入所有物理行（默认）" inactive-text="仅导入可见行" /></el-form-item><el-form-item label="产品主数据策略"><el-select v-model="masterDataPolicy" style="width:280px"><el-option label="用导入值补充空字段（默认）" value="FILL_EMPTY" /><el-option label="完全保留现有主数据" value="KEEP_EXISTING" /></el-select></el-form-item><el-form-item label="Excel文件"><el-upload :auto-upload="false" accept=".xlsx" :limit="1" :on-change="chooseFile"><el-button>选择 .xlsx 文件</el-button></el-upload></el-form-item></el-form></div>
         <div v-else-if="wizardStep === 2"><h3>选择工作表</h3><el-select v-model="selectedSheet" style="width: 320px"><el-option v-for="sheet in sheetNames" :key="sheet" :label="sheet" :value="sheet" /></el-select></div>
         <div v-else-if="wizardStep === 3" data-testid="field-mapping"><h3>字段匹配</h3><p>列号从 1 开始；每个 Excel 列只能映射一次。</p><el-row :gutter="16"><el-col v-for="(_, field) in mapping" :key="field" :span="8"><el-form-item :label="field"><el-input-number v-model="mapping[field]" :min="1" /></el-form-item></el-col></el-row></div>
         <div v-else-if="wizardStep === 4" data-testid="preview-table"><div class="preview-tools"><h3>数据预览（最多100行）</h3><el-radio-group v-model="previewFilter" @change="applyPreviewFilter"><el-radio-button value="">全部</el-radio-button><el-radio-button value="ERROR">只看错误</el-radio-button><el-radio-button value="WARNING">只看警告</el-radio-button></el-radio-group></div><el-table :data="previewRows" max-height="430" :row-class-name="tableRowClassName"><el-table-column prop="excel_row_number" label="Excel行号" width="100" fixed /><el-table-column v-for="column in previewColumns" :key="column" :prop="`data.${column}`" :label="column" min-width="150" :fixed="['product_code','product_name','specification'].includes(column) ? 'left' : false" /></el-table></div>
@@ -230,7 +247,7 @@ onMounted(refresh)
         <div v-else-if="wizardStep === 7" data-testid="weekly-plan-staging"><h3>周计划待匹配</h3><el-alert title="真实周计划没有产品编码。名称和规格只用于搜索候选，必须人工确认后才生成标准化周计划记录。" type="warning" show-icon /><el-table :data="weeklyStagingRows" max-height="420"><el-table-column prop="source_row_number" label="Excel行" width="80" /><el-table-column prop="product_name_raw" label="产品名称原值" min-width="150" /><el-table-column prop="specification_raw" label="规格原值" min-width="130" /><el-table-column prop="production_batch_no" label="批次" width="130" /><el-table-column prop="process_name" label="工序" width="90" /><el-table-column prop="weekly_plan_qty" label="周计划" width="90" /><el-table-column prop="match_status" label="匹配状态" width="110" /><el-table-column label="人工匹配" min-width="330"><template #default="scope"><div class="match-controls"><el-select v-model="weeklyMatches[scope.row.id].productId" filterable remote :remote-method="searchCandidates" placeholder="按编码、名称或规格搜索"><el-option v-for="candidate in productCandidates" :key="candidate.id" :value="candidate.id" :label="`${candidate.product_code} · ${candidate.product_name ?? ''} · ${candidate.specification ?? ''}`" /></el-select><el-button type="primary" :disabled="scope.row.match_status === 'MATCHED'" @click="confirmWeeklyMatch(scope.row)">确认</el-button></div></template></el-table-column></el-table></div>
         <el-result v-else icon="success" title="导入完成" :sub-title="`已导入 ${currentBatch?.imported_rows ?? 0} 行`" />
       </div>
-      <template #footer><el-button @click="wizardVisible = false">关闭</el-button><el-button v-if="wizardStep < 8" type="primary" :disabled="(wizardStep === 5 && !canValidate) || (wizardStep === 6 && !canConfirm)" @click="nextWizardStep">{{ wizardStep === 6 ? '确认导入' : wizardStep === 7 ? '完成匹配' : '下一步' }}</el-button></template>
+      <template #footer><el-button :disabled="importProcessing" @click="wizardVisible = false">关闭</el-button><el-button v-if="wizardStep < 8" type="primary" :loading="importProcessing" :disabled="(wizardStep === 5 && !canValidate) || (wizardStep === 6 && !canConfirm)" @click="nextWizardStep">{{ wizardStep === 6 ? '确认导入' : wizardStep === 7 ? '完成匹配' : '下一步' }}</el-button></template>
     </el-dialog>
 
     <el-drawer v-model="detailVisible" size="58%" title="导入批次详情" data-testid="batch-detail">

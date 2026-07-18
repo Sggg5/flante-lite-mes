@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     initial_admin_username: str = "admin"
     initial_admin_password: str | None = None
     cors_origins: str | None = None
-    import_max_file_size_mb: int = 20
+    import_max_file_size_mb: int = 64
     import_storage_dir: str = "./data/imports"
 
     @model_validator(mode="after")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import re
 from datetime import UTC, date, datetime, time
@@ -33,7 +34,7 @@ from app.services.excel_import import (
     make_batch_no,
     rollback_product_import_changes,
     safe_filename,
-    sha256_bytes,
+    sha256_file,
     validate_batch,
 )
 from app.services.identity import get_role_codes
@@ -89,7 +90,7 @@ def raise_state_error(request: Request, batch: ImportBatch, *, validation_requir
     raise HTTPException(status_code=409, detail=error_payload(request, code, message, {"status": batch.status}))
 
 
-def storage_path(batch: ImportBatch) -> Path:
+def storage_path(batch: ImportBatch, *, verify_integrity: bool = False) -> Path:
     settings = get_settings()
     storage = Path(settings.import_storage_dir).resolve()
     path = (storage / batch.stored_filename).resolve()
@@ -97,6 +98,12 @@ def storage_path(batch: ImportBatch) -> Path:
         raise ImportValidationError("STORED_FILE_INVALID", "导入文件安全标识无效")
     if not path.is_file():
         raise ImportValidationError("STORED_FILE_MISSING", "导入源文件已不存在")
+    if verify_integrity and sha256_file(path) != batch.file_sha256:
+        raise ImportValidationError(
+            "IMPORT_FILE_INTEGRITY_FAILED",
+            "存储的导入文件已被修改，文件完整性校验失败",
+            {"batch_id": batch.id},
+        )
     return path
 
 
@@ -158,36 +165,43 @@ async def upload_import(
     if Path(original_name).suffix.lower() != ".xlsx":
         raise HTTPException(status_code=415, detail=error_payload(request, "XLSX_REQUIRED", "仅允许上传 .xlsx 文件"))
     settings = get_settings()
-    chunks: list[bytes] = []
-    size = 0
-    while chunk := await file.read(1024 * 1024):
-        size += len(chunk)
-        if size > settings.import_max_file_size_bytes:
-            raise HTTPException(status_code=413, detail=error_payload(request, "IMPORT_FILE_TOO_LARGE", "上传文件超过大小限制", {"max_mb": settings.import_max_file_size_mb}))
-        chunks.append(chunk)
-    content = b"".join(chunks)
-    digest = sha256_bytes(content)
-    duplicate = find_duplicate_import_batch(
-        db,
-        import_type=normalized_type,
-        file_sha256=digest,
-        source_date=source_date,
-        lock=True,
-    )
-    if duplicate and not force:
-        raise HTTPException(status_code=409, detail=error_payload(request, "DUPLICATE_IMPORT_FILE", "相同类型、文件和数据日期已存在导入批次", {"batch_id": duplicate.id, "batch_no": duplicate.batch_no}))
-    if force and ("ADMIN" not in get_role_codes(actor) or not force_reason or len(force_reason.strip()) < 2):
-        raise HTTPException(status_code=403, detail=error_payload(request, "FORCE_IMPORT_REASON_REQUIRED", "仅管理员可在填写原因后强制重复导入"))
     storage = Path(settings.import_storage_dir).resolve()
     storage.mkdir(parents=True, exist_ok=True)
+    # Keep an .xlsx suffix because openpyxl validates the filename extension.
+    temporary_path = storage / f".upload-{uuid4().hex}.tmp.xlsx"
     stored_name = f"{uuid4().hex}.xlsx"
     stored_path = storage / stored_name
-    stored_path.write_bytes(content)
+    size = 0
+    hasher = hashlib.sha256()
     try:
-        workbook = load_safe_workbook(stored_path)
+        with temporary_path.open("xb") as target:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > settings.import_max_file_size_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=error_payload(
+                            request,
+                            "IMPORT_FILE_TOO_LARGE",
+                            "上传文件超过大小限制",
+                            {"max_mb": settings.import_max_file_size_mb},
+                        ),
+                    )
+                hasher.update(chunk)
+                target.write(chunk)
+        digest = hasher.hexdigest()
+        workbook = load_safe_workbook(temporary_path)
         sheet_count = len(workbook.sheetnames)
         sheet_names = list(workbook.sheetnames)
         workbook.close()
+        duplicate = find_duplicate_import_batch(
+            db, import_type=normalized_type, file_sha256=digest, source_date=source_date, lock=True
+        )
+        if duplicate and not force:
+            raise HTTPException(status_code=409, detail=error_payload(request, "DUPLICATE_IMPORT_FILE", "相同类型、文件和数据日期已存在导入批次", {"batch_id": duplicate.id, "batch_no": duplicate.batch_no}))
+        if force and ("ADMIN" not in get_role_codes(actor) or not force_reason or len(force_reason.strip()) < 2):
+            raise HTTPException(status_code=403, detail=error_payload(request, "FORCE_IMPORT_REASON_REQUIRED", "仅管理员可在填写原因后强制重复导入"))
+        temporary_path.replace(stored_path)
         batch = ImportBatch(
             batch_no=make_batch_no(), import_type=normalized_type, original_filename=original_name,
             stored_filename=stored_name, file_sha256=digest, file_size=size,
@@ -200,10 +214,17 @@ async def upload_import(
         db.commit()
     except ImportValidationError as exc:
         db.rollback()
+        temporary_path.unlink(missing_ok=True)
         stored_path.unlink(missing_ok=True)
         raise_import_error(request, exc)
+    except HTTPException:
+        db.rollback()
+        temporary_path.unlink(missing_ok=True)
+        stored_path.unlink(missing_ok=True)
+        raise
     except Exception:
         db.rollback()
+        temporary_path.unlink(missing_ok=True)
         stored_path.unlink(missing_ok=True)
         raise
     result = serialize_batch(batch)
@@ -244,7 +265,7 @@ def get_import(batch_id: int, request: Request, db: Session = Depends(get_db), a
 def get_sheets(batch_id: int, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.view"))) -> dict[str, Any]:
     batch = get_batch_or_404(db, request, batch_id)
     try:
-        return analyze_workbook(storage_path(batch), batch.import_type)
+        return analyze_workbook(storage_path(batch, verify_integrity=True), batch.import_type)
     except ImportValidationError as exc:
         raise_import_error(request, exc)
 
@@ -255,7 +276,7 @@ def analyze_import(batch_id: int, payload: AnalyzeImportRequest, request: Reques
     if batch.status not in {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY"}:
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_STATE_INVALID", "当前批次状态不能重新分析"))
     try:
-        path = storage_path(batch)
+        path = storage_path(batch, verify_integrity=True)
         analysis = analyze_workbook(path, batch.import_type, payload.sheet_name)
         workbook_analysis = analyze_workbook(path, batch.import_type) if batch.import_type == "WEEKLY_PLAN" else analysis
     except ImportValidationError as exc:
@@ -347,7 +368,7 @@ def preview_import(batch_id: int, request: Request, issue_filter: str | None = Q
     batch = get_batch_or_404(db, request, batch_id)
     try:
         rows = []
-        for row_number, normalized, problems in iter_normalized_rows(storage_path(batch), batch):
+        for row_number, normalized, problems in iter_normalized_rows(storage_path(batch, verify_integrity=True), batch):
             if not normalized:
                 continue
             severities = {item["severity"] for item in problems}
@@ -368,7 +389,7 @@ def validate_import(batch_id: int, request: Request, db: Session = Depends(get_d
         raise_state_error(request, batch)
     before = {"status": batch.status, "total_rows": batch.total_rows, "error_rows": batch.error_rows}
     try:
-        result = validate_batch(db, batch, storage_path(batch))
+        result = validate_batch(db, batch, storage_path(batch, verify_integrity=True))
     except ImportValidationError as exc:
         db.rollback()
         raise_import_error(request, exc)
@@ -415,7 +436,7 @@ def confirm_import(batch_id: int, request: Request, db: Session = Depends(get_db
         current = get_batch_or_404(db, request, batch_id)
         raise_state_error(request, current, validation_required=True)
     try:
-        path = storage_path(batch)
+        path = storage_path(batch, verify_integrity=True)
         db.flush()
         imported, product_changes = import_validated_batch(db, batch, path)
         batch.status = "COMPLETED"
@@ -541,8 +562,21 @@ def search_product_candidates(batch_id: int, request: Request, keyword: str = Qu
 
 @router.post("/{batch_id}/weekly-plan-staging/{staging_id}/match")
 def match_weekly_plan_staging(batch_id: int, staging_id: int, payload: MatchWeeklyPlanRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.confirm"))) -> dict[str, Any]:
-    batch = get_batch_or_404(db, request, batch_id)
-    staging = db.scalar(select(WeeklyPlanStagingRow).where(WeeklyPlanStagingRow.id == staging_id, WeeklyPlanStagingRow.import_batch_id == batch_id))
+    # This is the same row lock used by rollback. Whichever transaction obtains
+    # it second must re-check status and cannot leave data behind after rollback.
+    batch = get_batch_for_update(db, request, batch_id)
+    if batch.import_type != "WEEKLY_PLAN":
+        raise HTTPException(status_code=422, detail=error_payload(request, "WEEKLY_PLAN_BATCH_REQUIRED", "该批次不是周计划导入"))
+    if batch.status != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(request, "IMPORT_STATE_INVALID", "只有已完成且未撤销的周计划批次可以匹配或忽略", {"status": batch.status}),
+        )
+    staging = db.scalar(
+        select(WeeklyPlanStagingRow)
+        .where(WeeklyPlanStagingRow.id == staging_id, WeeklyPlanStagingRow.import_batch_id == batch_id)
+        .with_for_update()
+    )
     if staging is None:
         raise HTTPException(status_code=404, detail=error_payload(request, "WEEKLY_PLAN_STAGING_NOT_FOUND", "周计划待匹配记录不存在"))
     before = {"match_status": staging.match_status, "matched_product_id": staging.matched_product_id}
