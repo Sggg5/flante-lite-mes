@@ -27,6 +27,7 @@ from app.services.excel_import import (
     ImportValidationError,
     analyze_workbook,
     batch_has_downstream_references,
+    batch_referenced_by_replenishment,
     find_duplicate_import_batch,
     import_validated_batch,
     iter_normalized_rows,
@@ -469,6 +470,8 @@ def rollback_import(batch_id: int, payload: RollbackImportRequest, request: Requ
         raise HTTPException(status_code=404, detail=error_payload(request, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在"))
     if batch.status != "COMPLETED":
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_ROLLBACK_NOT_ALLOWED", "只有已完成批次可以撤销"))
+    if batch_referenced_by_replenishment(db, batch):
+        raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_BATCH_REFERENCED_BY_REPLENISHMENT", "导入批次已被补库运行引用，不能撤销"))
     if batch_has_downstream_references(db, batch):
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_BATCH_REFERENCED", "导入批次已被后续业务引用，不能撤销"))
     try:

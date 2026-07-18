@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import Request
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app.models import AuditLog, User
@@ -31,8 +32,8 @@ def write_audit_log(
         entity_type=entity_type,
         entity_id=entity_id,
         context_import_batch_id=context_import_batch_id,
-        before_data=before_data,
-        after_data=after_data,
+        before_data=jsonable_encoder(before_data) if before_data is not None else None,
+        after_data=jsonable_encoder(after_data) if after_data is not None else None,
         reason=reason,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),

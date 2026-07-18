@@ -104,7 +104,10 @@ class ImportedRecordMixin(TimestampMixin):
 
 class ShipmentRecord(Base, ImportedRecordMixin):
     __tablename__ = "shipment_records"
-    __table_args__ = (UniqueConstraint("import_batch_id", "source_sheet", "source_row_number"),)
+    __table_args__ = (
+        UniqueConstraint("import_batch_id", "source_sheet", "source_row_number"),
+        Index("ix_shipment_records_batch_product_date", "import_batch_id", "product_id", "shipment_date"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -117,6 +120,7 @@ class ShipmentRecord(Base, ImportedRecordMixin):
 
 class InventorySnapshot(Base, ImportedRecordMixin):
     __tablename__ = "inventory_snapshots"
+    __table_args__ = (Index("ix_inventory_snapshots_batch_product", "import_batch_id", "product_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -130,6 +134,7 @@ class InventorySnapshot(Base, ImportedRecordMixin):
 
 class PipeWipSnapshot(Base, ImportedRecordMixin):
     __tablename__ = "pipe_wip_snapshots"
+    __table_args__ = (Index("ix_pipe_wip_snapshots_batch_product", "import_batch_id", "product_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -139,6 +144,7 @@ class PipeWipSnapshot(Base, ImportedRecordMixin):
 
 class FittingWipSnapshot(Base, ImportedRecordMixin):
     __tablename__ = "fitting_wip_snapshots"
+    __table_args__ = (Index("ix_fitting_wip_snapshots_batch_product", "import_batch_id", "product_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -149,6 +155,7 @@ class FittingWipSnapshot(Base, ImportedRecordMixin):
 
 class RegularProductionProduct(Base, ImportedRecordMixin):
     __tablename__ = "regular_production_products"
+    __table_args__ = (Index("ix_regular_products_batch_product", "import_batch_id", "product_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -156,6 +163,9 @@ class RegularProductionProduct(Base, ImportedRecordMixin):
 
 class ImportedWeeklyPlanRaw(Base, ImportedRecordMixin):
     __tablename__ = "imported_weekly_plan_raw"
+    __table_args__ = (
+        Index("ix_weekly_plan_batch_product_period", "import_batch_id", "product_id", "plan_start_date", "plan_end_date"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
