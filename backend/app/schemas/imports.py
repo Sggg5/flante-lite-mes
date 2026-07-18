@@ -26,6 +26,8 @@ class UpdateImportOptionsRequest(BaseModel):
     source_date: date | None = None
     master_data_policy: Literal["KEEP_EXISTING", "FILL_EMPTY", "ADMIN_UPDATE"] = "FILL_EMPTY"
     master_data_reason: str | None = Field(default=None, max_length=500)
+    force_duplicate: bool = False
+    force_reason: str | None = Field(default=None, max_length=500)
 
 
 class MatchWeeklyPlanRequest(BaseModel):

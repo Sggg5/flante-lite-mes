@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import require_permission
@@ -26,11 +26,12 @@ from app.services.excel_import import (
     ImportValidationError,
     analyze_workbook,
     batch_has_downstream_references,
-    delete_batch_records,
+    find_duplicate_import_batch,
     import_validated_batch,
     iter_normalized_rows,
     load_safe_workbook,
     make_batch_no,
+    rollback_product_import_changes,
     safe_filename,
     sha256_bytes,
     validate_batch,
@@ -39,6 +40,9 @@ from app.services.identity import get_role_codes
 
 
 router = APIRouter(prefix="/api/v1/imports", tags=["imports"])
+
+MUTABLE_IMPORT_STATES = {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY"}
+VALIDATABLE_IMPORT_STATES = {"ANALYZED", "VALIDATION_FAILED", "READY"}
 
 
 def csv_safe_cell(value: Any) -> Any:
@@ -66,6 +70,23 @@ def get_batch_or_404(db: Session, request: Request, batch_id: int) -> ImportBatc
             detail=error_payload(request, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在"),
         )
     return batch
+
+
+def get_batch_for_update(db: Session, request: Request, batch_id: int) -> ImportBatch:
+    batch = db.scalar(select(ImportBatch).where(ImportBatch.id == batch_id).with_for_update())
+    if batch is None:
+        raise HTTPException(status_code=404, detail=error_payload(request, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在"))
+    return batch
+
+
+def raise_state_error(request: Request, batch: ImportBatch, *, validation_required: bool = False) -> None:
+    if batch.status == "COMPLETED":
+        code, message = "IMPORT_ALREADY_COMPLETED", "导入批次已经完成，不能重复执行该操作"
+    elif validation_required and batch.status in {"UPLOADED", "ANALYZED", "VALIDATION_FAILED"}:
+        code, message = "IMPORT_VALIDATION_REQUIRED", "导入批次必须完成全量校验并达到 READY 状态"
+    else:
+        code, message = "IMPORT_STATE_INVALID", f"当前批次状态 {batch.status} 不允许执行该操作"
+    raise HTTPException(status_code=409, detail=error_payload(request, code, message, {"status": batch.status}))
 
 
 def storage_path(batch: ImportBatch) -> Path:
@@ -107,7 +128,7 @@ def serialize_batch(batch: ImportBatch) -> dict[str, Any]:
         "cancel_reason": batch.cancel_reason,
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
-        "source_date": (batch.import_options or {}).get("source_date"),
+        "source_date": batch.source_date.isoformat() if batch.source_date else None,
         "include_hidden_rows": (batch.import_options or {}).get("include_hidden_rows", True),
         "hidden_data_rows": (batch.import_options or {}).get("hidden_data_rows", 0),
         "excluded_hidden_data_rows": (batch.import_options or {}).get("excluded_hidden_data_rows", 0),
@@ -146,8 +167,13 @@ async def upload_import(
         chunks.append(chunk)
     content = b"".join(chunks)
     digest = sha256_bytes(content)
-    duplicate_candidates = db.scalars(select(ImportBatch).where(ImportBatch.import_type == normalized_type, ImportBatch.file_sha256 == digest)).all()
-    duplicate = next((item for item in duplicate_candidates if (item.import_options or {}).get("source_date") == (source_date.isoformat() if source_date else None) and item.status not in {"CANCELLED", "ROLLED_BACK"}), None)
+    duplicate = find_duplicate_import_batch(
+        db,
+        import_type=normalized_type,
+        file_sha256=digest,
+        source_date=source_date,
+        lock=True,
+    )
     if duplicate and not force:
         raise HTTPException(status_code=409, detail=error_payload(request, "DUPLICATE_IMPORT_FILE", "相同类型、文件和数据日期已存在导入批次", {"batch_id": duplicate.id, "batch_no": duplicate.batch_no}))
     if force and ("ADMIN" not in get_role_codes(actor) or not force_reason or len(force_reason.strip()) < 2):
@@ -165,8 +191,8 @@ async def upload_import(
         batch = ImportBatch(
             batch_no=make_batch_no(), import_type=normalized_type, original_filename=original_name,
             stored_filename=stored_name, file_sha256=digest, file_size=size,
-            workbook_sheet_count=sheet_count, status="UPLOADED", created_by=actor.id,
-            import_options={"source_date": source_date.isoformat() if source_date else None, "include_hidden_rows": include_hidden_rows, "master_data_policy": master_data_policy, "force": force, "force_reason": force_reason},
+            source_date=source_date, workbook_sheet_count=sheet_count, status="UPLOADED", created_by=actor.id,
+            import_options={"source_date": source_date.isoformat() if source_date else None, "include_hidden_rows": include_hidden_rows, "master_data_policy": master_data_policy, "force_duplicate": force, "force_reason": force_reason},
         )
         db.add(batch)
         db.flush()
@@ -225,7 +251,7 @@ def get_sheets(batch_id: int, request: Request, db: Session = Depends(get_db), a
 
 @router.post("/{batch_id}/analyze")
 def analyze_import(batch_id: int, payload: AnalyzeImportRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.validate"))) -> dict[str, Any]:
-    batch = get_batch_or_404(db, request, batch_id)
+    batch = get_batch_for_update(db, request, batch_id)
     if batch.status not in {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY"}:
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_STATE_INVALID", "当前批次状态不能重新分析"))
     try:
@@ -248,7 +274,9 @@ def analyze_import(batch_id: int, payload: AnalyzeImportRequest, request: Reques
 
 @router.put("/{batch_id}/mapping")
 def update_mapping(batch_id: int, payload: UpdateMappingRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.validate"))) -> dict[str, Any]:
-    batch = get_batch_or_404(db, request, batch_id)
+    batch = get_batch_for_update(db, request, batch_id)
+    if batch.status not in MUTABLE_IMPORT_STATES:
+        raise_state_error(request, batch)
     if not batch.selected_sheet_name:
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_NOT_ANALYZED", "请先分析并选择工作表"))
     allowed = set(TYPE_FIELDS[batch.import_type])
@@ -269,26 +297,47 @@ def update_mapping(batch_id: int, payload: UpdateMappingRequest, request: Reques
 @router.put("/{batch_id}/options")
 def update_import_options(batch_id: int, payload: UpdateImportOptionsRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.validate"))) -> dict[str, Any]:
     batch = get_batch_or_404(db, request, batch_id)
-    if batch.status not in {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY"}:
-        raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_OPTIONS_LOCKED", "当前批次状态不能修改导入选项"))
+    if batch.status not in MUTABLE_IMPORT_STATES:
+        raise_state_error(request, batch)
     if payload.master_data_policy == "ADMIN_UPDATE":
         if "ADMIN" not in get_role_codes(actor):
             raise HTTPException(status_code=403, detail=error_payload(request, "ADMIN_MASTER_UPDATE_REQUIRED", "只有管理员可以覆盖产品主数据"))
         if not payload.master_data_reason or len(payload.master_data_reason.strip()) < 2:
             raise HTTPException(status_code=422, detail=error_payload(request, "MASTER_DATA_REASON_REQUIRED", "覆盖产品主数据必须填写原因"))
+    if payload.force_duplicate:
+        if "ADMIN" not in get_role_codes(actor):
+            raise HTTPException(status_code=403, detail=error_payload(request, "FORCE_IMPORT_ADMIN_REQUIRED", "只有管理员可以强制保留重复批次"))
+        if not payload.force_reason or len(payload.force_reason.strip()) < 2:
+            raise HTTPException(status_code=422, detail=error_payload(request, "FORCE_IMPORT_REASON_REQUIRED", "强制重复必须填写原因"))
+    duplicate = find_duplicate_import_batch(
+        db,
+        import_type=batch.import_type,
+        file_sha256=batch.file_sha256,
+        source_date=payload.source_date,
+        exclude_batch_id=batch.id,
+        lock=True,
+    )
+    if duplicate is not None and not payload.force_duplicate:
+        raise HTTPException(status_code=409, detail=error_payload(request, "DUPLICATE_IMPORT_FILE", "修改数据日期后形成重复导入批次", {"batch_id": duplicate.id, "batch_no": duplicate.batch_no}))
+    batch = get_batch_for_update(db, request, batch_id)
+    if batch.status not in MUTABLE_IMPORT_STATES:
+        raise_state_error(request, batch)
     before = batch.import_options or {}
+    before_source_date = batch.source_date
+    batch.source_date = payload.source_date
     batch.import_options = {
         **before,
         "include_hidden_rows": payload.include_hidden_rows,
         "source_date": payload.source_date.isoformat() if payload.source_date else None,
         "master_data_policy": payload.master_data_policy,
         "master_data_reason": payload.master_data_reason,
+        "force_duplicate": payload.force_duplicate,
+        "force_reason": payload.force_reason,
         "hidden_data_rows": 0,
         "excluded_hidden_data_rows": 0,
     }
-    if batch.status in {"VALIDATION_FAILED", "READY"}:
-        batch.status = "ANALYZED"
-    write_audit_log(db, request, user=actor, action="import.options.update", entity_type="import_batch", entity_id=str(batch.id), before_data=before, after_data=batch.import_options, reason=payload.master_data_reason)
+    batch.status = "ANALYZED" if batch.selected_sheet_name else "UPLOADED"
+    write_audit_log(db, request, user=actor, action="import.options.update", entity_type="import_batch", entity_id=str(batch.id), before_data={**before, "source_date": before_source_date.isoformat() if before_source_date else None}, after_data=batch.import_options, reason=payload.force_reason or payload.master_data_reason)
     db.commit()
     return serialize_batch(batch)
 
@@ -314,7 +363,9 @@ def preview_import(batch_id: int, request: Request, issue_filter: str | None = Q
 
 @router.post("/{batch_id}/validate")
 def validate_import(batch_id: int, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.validate"))) -> dict[str, Any]:
-    batch = get_batch_or_404(db, request, batch_id)
+    batch = get_batch_for_update(db, request, batch_id)
+    if batch.status not in VALIDATABLE_IMPORT_STATES:
+        raise_state_error(request, batch)
     before = {"status": batch.status, "total_rows": batch.total_rows, "error_rows": batch.error_rows}
     try:
         result = validate_batch(db, batch, storage_path(batch))
@@ -329,11 +380,42 @@ def validate_import(batch_id: int, request: Request, db: Session = Depends(get_d
 @router.post("/{batch_id}/confirm")
 def confirm_import(batch_id: int, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.confirm"))) -> dict[str, Any]:
     batch = get_batch_or_404(db, request, batch_id)
-    if batch.status == "COMPLETED":
-        return serialize_batch(batch)
+    if batch.status != "READY":
+        raise_state_error(request, batch, validation_required=True)
+    duplicate = find_duplicate_import_batch(
+        db,
+        import_type=batch.import_type,
+        file_sha256=batch.file_sha256,
+        source_date=batch.source_date,
+        exclude_batch_id=batch.id,
+        lock=True,
+    )
+    options = batch.import_options or {}
+    duplicate_approved = bool(options.get("force_duplicate") and options.get("force_reason"))
+    if duplicate is not None and not duplicate_approved:
+        raise HTTPException(status_code=409, detail=error_payload(request, "DUPLICATE_IMPORT_FILE", "确认前检测到重复导入批次", {"batch_id": duplicate.id, "batch_no": duplicate.batch_no}))
+    batch = db.scalar(
+        select(ImportBatch)
+        .where(ImportBatch.id == batch_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if batch is None:
+        raise HTTPException(status_code=404, detail=error_payload(request, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在"))
+    if batch.status != "READY":
+        raise_state_error(request, batch, validation_required=True)
+    claimed = db.execute(
+        update(ImportBatch)
+        .where(ImportBatch.id == batch_id, ImportBatch.status == "READY")
+        .values(status="IMPORTING")
+        .execution_options(synchronize_session="fetch")
+    )
+    if claimed.rowcount != 1:
+        db.rollback()
+        current = get_batch_or_404(db, request, batch_id)
+        raise_state_error(request, current, validation_required=True)
     try:
         path = storage_path(batch)
-        batch.status = "IMPORTING"
         db.flush()
         imported, product_changes = import_validated_batch(db, batch, path)
         batch.status = "COMPLETED"
@@ -342,7 +424,7 @@ def confirm_import(batch_id: int, request: Request, db: Session = Depends(get_db
         batch.confirmed_at = datetime.now(UTC)
         write_audit_log(db, request, user=actor, action="import.confirm", entity_type="import_batch", entity_id=str(batch.id), before_data={"status": "READY"}, after_data={"status": "COMPLETED", "imported_rows": imported})
         for change in product_changes:
-            write_audit_log(db, request, user=actor, action="product.master_data.import", entity_type="product", entity_id=str(change["product_id"]), before_data=change["before"], after_data={**change["after"], "changed_fields": change["fields"], "import_batch_id": batch.id}, reason=(batch.import_options or {}).get("master_data_reason") or "按导入策略补充产品主数据")
+            write_audit_log(db, request, user=actor, action="product.master_data.import", entity_type="product", entity_id=str(change["product_id"]), context_import_batch_id=batch.id, before_data=change["before"], after_data={**change["after"], "change_type": change["change_type"], "changed_fields": change["fields"], "import_batch_id": batch.id}, reason=(batch.import_options or {}).get("master_data_reason") or "按导入策略补充产品主数据")
         db.commit()
         return serialize_batch(batch)
     except ImportValidationError as exc:
@@ -361,20 +443,39 @@ def confirm_import(batch_id: int, request: Request, db: Session = Depends(get_db
 
 @router.post("/{batch_id}/rollback")
 def rollback_import(batch_id: int, payload: RollbackImportRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("import.rollback"))) -> dict[str, Any]:
-    batch = get_batch_or_404(db, request, batch_id)
+    batch = db.scalar(select(ImportBatch).where(ImportBatch.id == batch_id).with_for_update())
+    if batch is None:
+        raise HTTPException(status_code=404, detail=error_payload(request, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在"))
     if batch.status != "COMPLETED":
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_ROLLBACK_NOT_ALLOWED", "只有已完成批次可以撤销"))
     if batch_has_downstream_references(db, batch):
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_BATCH_REFERENCED", "导入批次已被后续业务引用，不能撤销"))
-    delete_batch_records(db, batch.id)
-    batch.status = "ROLLED_BACK"
-    batch.cancelled_by = actor.id
-    batch.cancelled_at = datetime.now(UTC)
-    batch.cancel_reason = payload.reason
-    write_audit_log(db, request, user=actor, action="import.rollback", entity_type="import_batch", entity_id=str(batch.id), before_data={"status": "COMPLETED", "imported_rows": batch.imported_rows}, after_data={"status": "ROLLED_BACK", "imported_rows": 0}, reason=payload.reason)
-    batch.imported_rows = 0
-    db.commit()
-    return serialize_batch(batch)
+    try:
+        restorations = rollback_product_import_changes(db, batch)
+        for restoration in restorations:
+            write_audit_log(
+                db,
+                request,
+                user=actor,
+                action="product.master_data.rollback",
+                entity_type="product",
+                entity_id=str(restoration["product_id"]),
+                context_import_batch_id=batch.id,
+                before_data=restoration["before"],
+                after_data={"restored": restoration["after"], "change_type": restoration["change_type"], "changed_fields": restoration["changed_fields"]},
+                reason=payload.reason,
+            )
+        batch.status = "ROLLED_BACK"
+        batch.cancelled_by = actor.id
+        batch.cancelled_at = datetime.now(UTC)
+        batch.cancel_reason = payload.reason
+        write_audit_log(db, request, user=actor, action="import.rollback", entity_type="import_batch", entity_id=str(batch.id), before_data={"status": "COMPLETED", "imported_rows": batch.imported_rows}, after_data={"status": "ROLLED_BACK", "imported_rows": 0}, reason=payload.reason)
+        batch.imported_rows = 0
+        db.commit()
+        return serialize_batch(batch)
+    except ImportValidationError as exc:
+        db.rollback()
+        raise_import_error(request, exc, 409)
 
 
 @router.get("/{batch_id}/issues")
@@ -474,7 +575,7 @@ def match_weekly_plan_staging(batch_id: int, staging_id: int, payload: MatchWeek
     staging.matched_at = datetime.now(UTC)
     staging.match_reason = payload.reason
     after = {"match_status": staging.match_status, "matched_product_id": staging.matched_product_id}
-    write_audit_log(db, request, user=actor, action="weekly_plan.match", entity_type="weekly_plan_staging", entity_id=str(staging.id), before_data=before, after_data=after, reason=payload.reason)
+    write_audit_log(db, request, user=actor, action="weekly_plan.match", entity_type="weekly_plan_staging", entity_id=str(staging.id), context_import_batch_id=batch.id, before_data=before, after_data=after, reason=payload.reason)
     db.commit()
     return serialize_weekly_staging(staging)
 
@@ -484,7 +585,7 @@ def list_import_audit_logs(batch_id: int, request: Request, db: Session = Depend
     get_batch_or_404(db, request, batch_id)
     logs = db.scalars(
         select(AuditLog)
-        .where(AuditLog.entity_type == "import_batch", AuditLog.entity_id == str(batch_id))
+        .where(AuditLog.context_import_batch_id == batch_id)
         .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
     ).all()
     return {"items": [{"id": log.id, "action": log.action, "user_id": log.user_id, "before_data": log.before_data, "after_data": log.after_data, "reason": log.reason, "request_id": log.request_id, "occurred_at": log.occurred_at} for log in logs]}

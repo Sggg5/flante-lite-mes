@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -11,6 +11,9 @@ from app.models.identity import TimestampMixin
 
 class ImportBatch(Base, TimestampMixin):
     __tablename__ = "import_batches"
+    __table_args__ = (
+        Index("ix_import_batches_duplicate_lookup", "import_type", "file_sha256", "source_date", "status"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     batch_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
@@ -18,6 +21,7 @@ class ImportBatch(Base, TimestampMixin):
     original_filename: Mapped[str] = mapped_column(String(255))
     stored_filename: Mapped[str] = mapped_column(String(100), unique=True)
     file_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    source_date: Mapped[date | None] = mapped_column(Date, index=True)
     file_size: Mapped[int]
     workbook_sheet_count: Mapped[int] = mapped_column(default=0)
     selected_sheet_name: Mapped[str | None] = mapped_column(String(255))
@@ -73,6 +77,22 @@ class Product(Base, TimestampMixin):
     last_import_batch_id: Mapped[int | None] = mapped_column(
         ForeignKey("import_batches.id", ondelete="SET NULL"), index=True
     )
+
+
+class ProductImportChange(Base, TimestampMixin):
+    __tablename__ = "product_import_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    import_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("import_batches.id", ondelete="RESTRICT"), index=True
+    )
+    product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"), index=True
+    )
+    change_type: Mapped[str] = mapped_column(String(30), index=True)
+    before_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    after_data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    changed_fields: Mapped[list[str]] = mapped_column(JSON)
 
 
 class ImportedRecordMixin(TimestampMixin):

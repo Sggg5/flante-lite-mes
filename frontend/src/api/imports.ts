@@ -81,7 +81,7 @@ export async function uploadImport(importType: string, file: File, sourceDate?: 
   return (await http.post<ImportBatch>('/v1/imports/upload', form)).data
 }
 
-export async function updateImportOptions(batchId: number, payload: { include_hidden_rows: boolean; source_date?: string; master_data_policy: string; master_data_reason?: string }) {
+export async function updateImportOptions(batchId: number, payload: { include_hidden_rows: boolean; source_date?: string; master_data_policy: string; master_data_reason?: string; force_duplicate?: boolean; force_reason?: string }) {
   return (await http.put<ImportBatch>(`/v1/imports/${batchId}/options`, payload)).data
 }
 

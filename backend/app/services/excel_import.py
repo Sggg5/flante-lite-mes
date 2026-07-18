@@ -15,7 +15,7 @@ from openpyxl.cell import Cell
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.utils.datetime import from_excel
 from xml.etree.ElementTree import iterparse
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -26,6 +26,7 @@ from app.models import (
     InventorySnapshot,
     PipeWipSnapshot,
     Product,
+    ProductImportChange,
     RegularProductionProduct,
     ShipmentRecord,
     WeeklyPlanStagingRow,
@@ -40,8 +41,6 @@ IMPORT_TYPES = {
     "REGULAR_PRODUCT",
     "WEEKLY_PLAN",
 }
-TERMINAL_STATUSES = {"COMPLETED", "CANCELLED", "ROLLED_BACK"}
-MUTABLE_STATUSES = {"UPLOADED", "ANALYZED", "VALIDATION_FAILED", "READY", "FAILED"}
 EMPTY_ROW_STOP = 200
 MAX_SCAN_ROWS = 500_000
 SCIENCE_PATTERN = re.compile(r"^[+-]?\d+(?:\.\d+)?[Ee][+-]?\d+$")
@@ -117,6 +116,34 @@ def sha256_bytes(content: bytes) -> str:
 
 def make_batch_no() -> str:
     return f"IMP-{datetime.now(UTC):%Y%m%d%H%M%S}-{hashlib.sha1(str(datetime.now(UTC).timestamp()).encode()).hexdigest()[:8].upper()}"
+
+
+def find_duplicate_import_batch(
+    db: Session,
+    *,
+    import_type: str,
+    file_sha256: str,
+    source_date: date | None,
+    exclude_batch_id: int | None = None,
+    lock: bool = False,
+) -> ImportBatch | None:
+    if lock and db.get_bind().dialect.name == "postgresql":
+        identity = f"{import_type}|{file_sha256}|{source_date.isoformat() if source_date else '<NULL>'}"
+        advisory_key = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16], 16) & ((1 << 63) - 1)
+        db.execute(select(func.pg_advisory_xact_lock(advisory_key)))
+    statement = select(ImportBatch).where(
+        ImportBatch.import_type == import_type,
+        ImportBatch.file_sha256 == file_sha256,
+        ImportBatch.status.notin_({"CANCELLED", "ROLLED_BACK"}),
+    )
+    statement = statement.where(
+        ImportBatch.source_date.is_(None) if source_date is None else ImportBatch.source_date == source_date
+    )
+    if exclude_batch_id is not None:
+        statement = statement.where(ImportBatch.id != exclude_batch_id)
+    if lock:
+        statement = statement.with_for_update()
+    return db.scalar(statement.order_by(ImportBatch.id).limit(1))
 
 
 def load_safe_workbook(path: Path, *, read_only: bool = True):
@@ -262,6 +289,22 @@ def analyze_workbook(path: Path, import_type: str, selected_sheet: str | None = 
             raise ImportValidationError("SHEET_NOT_FOUND", "指定工作表不存在")
         sheet_results: list[dict[str, Any]] = []
         target_names = [selected_sheet] if selected_sheet else workbook.sheetnames
+        workbook_year: int | None = None
+        if import_type == "WEEKLY_PLAN":
+            for workbook_sheet_name in workbook.sheetnames:
+                candidate_layout = WEEKLY_SHEET_LAYOUTS.get(workbook_sheet_name)
+                if candidate_layout is None:
+                    continue
+                candidate_sheet = workbook[workbook_sheet_name]
+                title_text = " ".join(
+                    str(cell.value)
+                    for row in candidate_sheet.iter_rows(min_row=1, max_row=candidate_layout["header_end"])
+                    for cell in row
+                    if cell.value not in (None, "")
+                )
+                if year_match := re.search(r"(20\d{2})", title_text):
+                    workbook_year = int(year_match.group(1))
+                    break
         for name in target_names:
             worksheet = workbook[name]
             effective = scan_effective_range(worksheet)
@@ -270,13 +313,14 @@ def analyze_workbook(path: Path, import_type: str, selected_sheet: str | None = 
             for row in worksheet.iter_rows(min_row=1, max_row=min(max(effective["last_row"], 1), 12)):
                 preview_rows.append([cell.value for cell in row[: max(effective["last_column"], 1)]])
             header_start, header_end, mapping = detect_header(preview_rows, import_type)
-            detected_dates = sorted({
-                parsed
-                for row in preview_rows[:header_end]
-                for value in row
-                if isinstance(value, (date, datetime)) or (isinstance(value, (int, float)) and value > 30_000) or (isinstance(value, str) and re.search(r"20\d{2}|\d{1,2}[./-]\d{1,2}", value))
-                if (parsed := parse_date(value)) is not None
-            })
+            weekly_dates = infer_week_dates(worksheet, WEEKLY_SHEET_LAYOUTS[name], workbook_year) if import_type == "WEEKLY_PLAN" and name in WEEKLY_SHEET_LAYOUTS else None
+            detected_dates = weekly_dates or sorted({
+                    parsed
+                    for row in preview_rows[:header_end]
+                    for value in row
+                    if isinstance(value, (date, datetime)) or (isinstance(value, (int, float)) and value > 30_000) or (isinstance(value, str) and re.search(r"20\d{2}|\d{1,2}[./-]\d{1,2}", value))
+                    if (parsed := parse_date(value)) is not None
+                })
             sheet_results.append(
                 {
                     "sheet_name": name,
@@ -355,7 +399,7 @@ def parse_date(value: Any) -> date | None:
     return None
 
 
-def infer_week_dates(worksheet, layout: dict[str, Any]) -> list[date] | None:
+def infer_week_dates(worksheet, layout: dict[str, Any], default_year: int | None = None) -> list[date] | None:
     title_values = [
         str(cell.value)
         for row in worksheet.iter_rows(min_row=1, max_row=layout["header_end"], values_only=False)
@@ -374,9 +418,10 @@ def infer_week_dates(worksheet, layout: dict[str, Any]) -> list[date] | None:
     if start is None:
         year_match = re.search(r"(20\d{2})", title)
         range_match = re.search(r"(\d{1,2})[./-](\d{1,2})\s*(?:至|到|[-~—])\s*(\d{1,2})[./-](\d{1,2})", title)
-        if year_match and range_match:
+        inferred_year = int(year_match.group(1)) if year_match else default_year
+        if inferred_year and range_match:
             try:
-                start = date(int(year_match.group(1)), int(range_match.group(1)), int(range_match.group(2)))
+                start = date(inferred_year, int(range_match.group(1)), int(range_match.group(2)))
             except ValueError:
                 start = None
     header_dates: list[date] = []
@@ -387,8 +432,11 @@ def infer_week_dates(worksheet, layout: dict[str, Any]) -> list[date] | None:
             value = worksheet.cell(row_number, column).value
             if isinstance(value, (date, datetime)):
                 parsed = value.date() if isinstance(value, datetime) else value
-            elif isinstance(value, (int, float)) and 1 <= int(value) <= 31:
-                day_number = int(value)
+            elif isinstance(value, (int, float)):
+                if 1 <= int(value) <= 31:
+                    day_number = int(value)
+                else:
+                    parsed = parse_date(value)
             elif isinstance(value, str):
                 parsed = parse_date(value)
                 day_match = re.fullmatch(r"\s*(\d{1,2})\s*(?:日|号)?\s*", value)
@@ -426,7 +474,14 @@ def iter_weekly_plan_rows(path: Path, batch: ImportBatch) -> Iterator[tuple[int,
         structure = extract_sheet_structure(path, worksheet)
         merged_lookup = merged_cell_lookup(structure["merged_ranges"])
         hidden_rows = structure["hidden_rows"]
-        week_dates = infer_week_dates(worksheet, layout)
+        stored_period = (options.get("sheet_periods") or {}).get(sheet_name) or []
+        stored_start = parse_date(stored_period[0]) if len(stored_period) > 0 else None
+        stored_end = parse_date(stored_period[1]) if len(stored_period) > 1 else None
+        if stored_start and stored_end and (stored_end - stored_start).days == 6:
+            week_dates = [stored_start.fromordinal(stored_start.toordinal() + offset) for offset in range(7)]
+        else:
+            default_year = batch.source_date.year if batch.source_date else None
+            week_dates = infer_week_dates(worksheet, layout, default_year)
         master_cells: dict[tuple[int, int], Cell] = {}
 
         def resolved_cell(row: tuple[Cell, ...], row_number: int, column: int | None) -> Cell | None:
@@ -458,9 +513,13 @@ def iter_weekly_plan_rows(path: Path, batch: ImportBatch) -> Iterator[tuple[int,
             actual_row_number = row_number + 1
             actual_kind_cell = resolved_cell(actual_row, actual_row_number, layout["row_kind"]) if actual_row else None
             has_actual_row = "实际" in str(actual_kind_cell.value or "")
+            actual_row_hidden = has_actual_row and actual_row_number in hidden_rows
+            actual_values_excluded = bool(actual_row_hidden and not include_hidden_rows)
             problems: list[dict[str, Any]] = []
             if not has_actual_row:
                 problems.append(issue(row_number, "WARNING", "row_kind", None, "WEEKLY_PLAN_ACTUAL_ROW_MISSING", "未找到配对实际行，计划仍进入待匹配区"))
+            elif actual_values_excluded:
+                problems.append(issue(row_number, "INFO", "daily_actual", None, "WEEKLY_ACTUAL_HIDDEN_EXCLUDED", "实际行已隐藏且用户选择仅导入可见行，实际量未读取"))
             if week_dates is None:
                 problems.append(issue(row_number, "ERROR", "plan_start_date", None, "WEEKLY_PLAN_PERIOD_UNRECOGNIZED", "无法从标题和日期表头识别七天计划周期"))
             name = resolved_cell(row, row_number, layout["name"])
@@ -481,7 +540,7 @@ def iter_weekly_plan_rows(path: Path, batch: ImportBatch) -> Iterator[tuple[int,
             for index, column in enumerate(layout["daily"]):
                 date_key = week_dates[index].isoformat() if week_dates else f"DAY_{index + 1}"
                 plan_cell = resolved_cell(row, row_number, column)
-                actual_cell = resolved_cell(actual_row, actual_row_number, column) if has_actual_row else None
+                actual_cell = resolved_cell(actual_row, actual_row_number, column) if has_actual_row and not actual_values_excluded else None
                 plan_value = parse_decimal(plan_cell.value) if plan_cell and plan_cell.data_type != "f" else None
                 actual_value = parse_decimal(actual_cell.value) if actual_cell and actual_cell.data_type != "f" else None
                 daily_plan[date_key] = str(plan_value) if plan_value is not None else None
@@ -524,6 +583,8 @@ def iter_weekly_plan_rows(path: Path, batch: ImportBatch) -> Iterator[tuple[int,
             }
             normalized["raw_data"] = {
                 "source_row_hidden": source_row_hidden,
+                "actual_row_hidden": actual_row_hidden,
+                "actual_row_excluded": actual_values_excluded,
                 "plan_row_number": row_number,
                 "actual_row_number": actual_row_number if has_actual_row else None,
                 "product_name_raw": normalized["product_name"],
@@ -687,8 +748,6 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
     existing_products: dict[str, Product | None] = {}
     hidden_data_rows = 0
     excluded_hidden_data_rows = 0
-    weekly_plan_rows: dict[tuple[Any, ...], int] = {}
-    weekly_actual_rows: dict[tuple[Any, ...], int] = {}
     issue_counts: Counter[str] = Counter()
     for row_number, normalized, problems in iter_normalized_rows(path, batch):
         if not normalized:
@@ -700,8 +759,13 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
                 db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
             continue
         total += 1
-        if normalized.get("raw_data", {}).get("source_row_hidden"):
+        raw_data = normalized.get("raw_data", {})
+        if raw_data.get("source_row_hidden"):
             hidden_data_rows += 1
+        if raw_data.get("actual_row_hidden"):
+            hidden_data_rows += 1
+        if raw_data.get("actual_row_excluded"):
+            excluded_hidden_data_rows += 1
         code = normalized.get("product_code")
         identity = (normalized.get("product_name"), normalized.get("specification"))
         if code and code in product_identity and product_identity[code] != identity:
@@ -745,15 +809,6 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
         for problem in problems:
             issue_counts[problem["issue_code"]] += 1
             db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
-    if batch.import_type == "WEEKLY_PLAN" and (weekly_plan_rows or weekly_actual_rows):
-        unpaired = {**{key: row for key, row in weekly_plan_rows.items() if key not in weekly_actual_rows}, **{key: row for key, row in weekly_actual_rows.items() if key not in weekly_plan_rows}}
-        for pair_key, row_number in unpaired.items():
-            if row_number not in error_rows:
-                valid = max(0, valid - 1)
-            error_rows.add(row_number)
-            problem = issue(row_number, "ERROR", "row_kind", pair_key, "WEEKLY_PLAN_PAIR_MISSING", "计划行和实际行无法配对")
-            issue_counts[problem["issue_code"]] += 1
-            db.add(ImportRowIssue(import_batch_id=batch.id, sheet_name=batch.selected_sheet_name or "", **problem))
     if batch.import_type == "WEEKLY_PLAN" and (batch.import_options or {}).get("plan_period_consistent") is False:
         warning_rows.add(0)
         problem = issue(0, "WARNING", "plan_start_date", None, "WEEKLY_PLAN_PERIOD_MISMATCH", "工作簿内不同工作表的计划周期不一致，请分别确认")
@@ -777,7 +832,7 @@ def validate_batch(db: Session, batch: ImportBatch, path: Path) -> dict[str, Any
 def get_or_create_product(
     db: Session, normalized: dict[str, Any], batch: ImportBatch
 ) -> tuple[Product, dict[str, Any] | None]:
-    product = db.scalar(select(Product).where(Product.product_code == normalized["product_code"]))
+    product = db.scalar(select(Product).where(Product.product_code == normalized["product_code"]).with_for_update())
     incoming_fields = {
         "product_name": normalized.get("product_name"),
         "specification": normalized.get("specification"),
@@ -793,9 +848,16 @@ def get_or_create_product(
         )
         db.add(product)
         db.flush()
-        return product, {"product_id": product.id, "before": None, "after": {"product_code": product.product_code, **incoming_fields}, "fields": list(incoming_fields)}
+        created_fields = ["product_code", *[field for field, value in incoming_fields.items() if value not in (None, "")]]
+        return product, {
+            "product_id": product.id,
+            "change_type": "CREATED",
+            "before": None,
+            "after": {"product_code": product.product_code, **incoming_fields, "last_import_batch_id": batch.id},
+            "fields": created_fields,
+        }
     policy = str((batch.import_options or {}).get("master_data_policy", "FILL_EMPTY"))
-    before = {field: getattr(product, field) for field in incoming_fields}
+    before = {**{field: getattr(product, field) for field in incoming_fields}, "last_import_batch_id": product.last_import_batch_id}
     changed_fields: list[str] = []
     for field, incoming_value in incoming_fields.items():
         if incoming_value in (None, ""):
@@ -810,8 +872,14 @@ def get_or_create_product(
     if changed_fields:
         product.last_import_batch_id = batch.id
         db.flush()
-        after = {field: getattr(product, field) for field in incoming_fields}
-        return product, {"product_id": product.id, "before": before, "after": after, "fields": changed_fields}
+        after = {**{field: getattr(product, field) for field in incoming_fields}, "last_import_batch_id": product.last_import_batch_id}
+        return product, {
+            "product_id": product.id,
+            "change_type": "ADMIN_UPDATED" if policy == "ADMIN_UPDATE" else "FILLED_EMPTY",
+            "before": before,
+            "after": after,
+            "fields": changed_fields,
+        }
     return product, None
 
 
@@ -837,11 +905,12 @@ def build_record(batch: ImportBatch, row_number: int, normalized: dict[str, Any]
 
 
 RECORD_MODELS = (ShipmentRecord, InventorySnapshot, PipeWipSnapshot, FittingWipSnapshot, RegularProductionProduct, ImportedWeeklyPlanRaw, WeeklyPlanStagingRow)
+PRODUCT_REFERENCE_MODELS = (ShipmentRecord, InventorySnapshot, PipeWipSnapshot, FittingWipSnapshot, RegularProductionProduct, ImportedWeeklyPlanRaw)
 
 
 def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> tuple[int, list[dict[str, Any]]]:
-    if batch.status not in {"READY", "IMPORTING"} or batch.error_rows:
-        raise ImportValidationError("IMPORT_NOT_READY", "批次存在错误或尚未完成校验")
+    if batch.status != "IMPORTING" or batch.error_rows:
+        raise ImportValidationError("IMPORT_VALIDATION_REQUIRED", "批次未通过全量校验或未由确认接口锁定")
     imported = 0
     product_changes_by_id: dict[int, dict[str, Any]] = {}
     parsed_rows = list(iter_normalized_rows(path, batch))
@@ -873,25 +942,32 @@ def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> tuple
             imported += 1
         db.flush()
         return imported, []
-    weekly_actual: dict[tuple[Any, ...], Decimal | None] = {}
-    if batch.import_type == "WEEKLY_PLAN":
-        for _, normalized, problems in parsed_rows:
-            if normalized and not any(item["severity"] == "ERROR" for item in problems) and "实际" in str(normalized.get("row_kind") or ""):
-                key = (normalized.get("product_code"), normalized.get("production_batch_no"), normalized.get("process_name"), normalized.get("equipment_name"))
-                weekly_actual[key] = normalized.get("actual_quantity")
     for row_number, normalized, problems in parsed_rows:
         if not normalized or any(item["severity"] == "ERROR" for item in problems):
             continue
-        if batch.import_type == "WEEKLY_PLAN":
-            if "实际" in str(normalized.get("row_kind") or ""):
-                continue
-            key = (normalized.get("product_code"), normalized.get("production_batch_no"), normalized.get("process_name"), normalized.get("equipment_name"))
-            normalized["actual_quantity"] = weekly_actual.get(key, normalized.get("actual_quantity"))
         product, product_change = get_or_create_product(db, normalized, batch)
         if product_change:
-            product_changes_by_id[product.id] = product_change
+            existing_change = product_changes_by_id.get(product.id)
+            if existing_change is None:
+                product_changes_by_id[product.id] = product_change
+            else:
+                existing_change["after"] = product_change["after"]
+                existing_change["fields"] = list(dict.fromkeys([*existing_change["fields"], *product_change["fields"]]))
+                if existing_change["change_type"] != "CREATED" and product_change["change_type"] == "ADMIN_UPDATED":
+                    existing_change["change_type"] = "ADMIN_UPDATED"
         db.add(build_record(batch, row_number, normalized, product))
         imported += 1
+    for product_change in product_changes_by_id.values():
+        db.add(
+            ProductImportChange(
+                import_batch_id=batch.id,
+                product_id=product_change["product_id"],
+                change_type=product_change["change_type"],
+                before_data=product_change["before"],
+                after_data=product_change["after"],
+                changed_fields=product_change["fields"],
+            )
+        )
     db.flush()
     return imported, list(product_changes_by_id.values())
 
@@ -899,6 +975,95 @@ def import_validated_batch(db: Session, batch: ImportBatch, path: Path) -> tuple
 def delete_batch_records(db: Session, batch_id: int) -> None:
     for model in RECORD_MODELS:
         db.execute(delete(model).where(model.import_batch_id == batch_id))
+
+
+def _product_has_other_batch_references(db: Session, product_id: int, batch_id: int) -> bool:
+    for model in PRODUCT_REFERENCE_MODELS:
+        reference = db.scalar(
+            select(model.id).where(model.product_id == product_id, model.import_batch_id != batch_id).limit(1)
+        )
+        if reference is not None:
+            return True
+    staging_reference = db.scalar(
+        select(WeeklyPlanStagingRow.id).where(
+            WeeklyPlanStagingRow.matched_product_id == product_id,
+            WeeklyPlanStagingRow.import_batch_id != batch_id,
+        ).limit(1)
+    )
+    return staging_reference is not None
+
+
+def rollback_product_import_changes(db: Session, batch: ImportBatch) -> list[dict[str, Any]]:
+    changes = db.scalars(
+        select(ProductImportChange)
+        .where(ProductImportChange.import_batch_id == batch.id)
+        .order_by(ProductImportChange.id.desc())
+        .with_for_update()
+    ).all()
+    pending: list[tuple[ProductImportChange, Product]] = []
+    for change in changes:
+        product = db.scalar(select(Product).where(Product.id == change.product_id).with_for_update()) if change.product_id is not None else None
+        if product is None:
+            raise ImportValidationError(
+                "PRODUCT_MASTER_ROLLBACK_CONFLICT",
+                "产品主数据已不存在，不能安全撤销该导入批次",
+                {"change_id": change.id},
+            )
+        if change.change_type == "CREATED":
+            if product.last_import_batch_id != batch.id or _product_has_other_batch_references(db, product.id, batch.id):
+                raise ImportValidationError(
+                    "PRODUCT_MASTER_ROLLBACK_CONFLICT",
+                    "当前批次新建的产品已被后续批次或其他数据引用，不能撤销",
+                    {"product_id": product.id, "product_code": product.product_code},
+                )
+        elif product.last_import_batch_id != batch.id:
+            raise ImportValidationError(
+                "PRODUCT_MASTER_ROLLBACK_CONFLICT",
+                "产品字段在当前批次之后又被其他批次修改，不能自动恢复",
+                {"product_id": product.id, "product_code": product.product_code, "last_import_batch_id": product.last_import_batch_id},
+            )
+        pending.append((change, product))
+
+    delete_batch_records(db, batch.id)
+    restoration_events: list[dict[str, Any]] = []
+    for change, product in pending:
+        before_restore = {
+            "product_code": product.product_code,
+            "product_name": product.product_name,
+            "specification": product.specification,
+            "category": product.category,
+            "unit": product.unit,
+            "last_import_batch_id": product.last_import_batch_id,
+        }
+        if change.change_type == "CREATED":
+            db.delete(product)
+            after_restore = None
+        else:
+            original = change.before_data or {}
+            for field in change.changed_fields:
+                if field in {"product_name", "specification", "category", "unit"}:
+                    setattr(product, field, original.get(field))
+            product.last_import_batch_id = original.get("last_import_batch_id")
+            after_restore = {
+                "product_code": product.product_code,
+                "product_name": product.product_name,
+                "specification": product.specification,
+                "category": product.category,
+                "unit": product.unit,
+                "last_import_batch_id": product.last_import_batch_id,
+            }
+        restoration_events.append(
+            {
+                "product_id": change.product_id,
+                "product_code": before_restore["product_code"],
+                "change_type": change.change_type,
+                "before": before_restore,
+                "after": after_restore,
+                "changed_fields": change.changed_fields,
+            }
+        )
+    db.flush()
+    return restoration_events
 
 
 def batch_has_downstream_references(db: Session, batch: ImportBatch) -> bool:

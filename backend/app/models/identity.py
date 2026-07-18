@@ -93,6 +93,9 @@ class AuditLog(Base, TimestampMixin):
     action: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     entity_type: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     entity_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    context_import_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("import_batches.id", ondelete="SET NULL"), index=True
+    )
     before_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     after_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     reason: Mapped[str | None] = mapped_column(Text)
