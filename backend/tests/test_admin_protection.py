@@ -1,7 +1,7 @@
 from sqlalchemy import select
 
 from app.core.security import hash_password, verify_password
-from app.models import Permission, Role, RolePermission, User, UserRole
+from app.models import AuditLog, Permission, Role, RolePermission, User, UserRole
 from app.services.identity import get_role_codes, seed_identity
 
 
@@ -51,6 +51,56 @@ def test_role_change_cannot_leave_system_without_admin(client, db):
     db.expire_all()
     admin = db.scalar(select(User).where(User.username == "admin"))
     assert get_role_codes(admin) == ["ADMIN"]
+
+
+def test_admin_can_demote_another_admin_and_audit_role_change(client, db, admin_token):
+    admin_role = db.scalar(select(Role).where(Role.code == "ADMIN"))
+    second_admin = User(
+        username="second-admin",
+        display_name="Second Admin",
+        password_hash=hash_password("SecondAdminTest123!"),
+        is_active=True,
+    )
+    second_admin.role_links.append(UserRole(role=admin_role))
+    db.add(second_admin)
+    db.commit()
+    target_user_id = second_admin.id
+    reason = "demote redundant administrator"
+
+    response = client.put(
+        f"/api/v1/users/{target_user_id}/roles",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"role_codes": ["VIEWER"], "reason": reason},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"user_id": target_user_id, "role_codes": ["VIEWER"]}
+
+    db.expire_all()
+    demoted_user = db.get(User, target_user_id)
+    assert get_role_codes(demoted_user) == ["VIEWER"]
+
+    active_admins = db.scalars(
+        select(User)
+        .join(UserRole)
+        .join(Role)
+        .where(User.is_active.is_(True), Role.code == "ADMIN")
+    ).all()
+    assert [user.username for user in active_admins] == ["admin"]
+
+    audit_log = db.scalar(
+        select(AuditLog).where(
+            AuditLog.action == "user.roles.update",
+            AuditLog.entity_type == "user",
+            AuditLog.entity_id == str(target_user_id),
+        )
+    )
+    actor = db.scalar(select(User).where(User.username == "admin"))
+    assert audit_log is not None
+    assert audit_log.user_id == actor.id
+    assert audit_log.before_data == {"role_codes": ["ADMIN"]}
+    assert audit_log.after_data == {"role_codes": ["VIEWER"]}
+    assert audit_log.reason == reason
 
 
 def test_init_db_restores_admin_role_without_resetting_password(db):
