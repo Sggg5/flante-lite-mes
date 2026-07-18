@@ -19,6 +19,8 @@ def test_development_settings_allow_local_cors_default():
     settings = make_settings()
 
     assert settings.cors_origin_list == ["http://localhost:5173"]
+    assert settings.import_max_file_size_mb == 64
+    assert settings.import_max_file_size_bytes == 64 * 1024 * 1024
 
 
 def test_production_rejects_development_secret_key():

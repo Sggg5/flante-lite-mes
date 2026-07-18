@@ -14,16 +14,23 @@ def write_audit_log(
     action: str,
     entity_type: str,
     entity_id: str | None = None,
+    context_import_batch_id: int | None = None,
     before_data: dict[str, Any] | None = None,
     after_data: dict[str, Any] | None = None,
     reason: str | None = None,
 ) -> AuditLog:
+    if context_import_batch_id is None and entity_type == "import_batch" and entity_id:
+        try:
+            context_import_batch_id = int(entity_id)
+        except ValueError:
+            context_import_batch_id = None
     log = AuditLog(
         request_id=request.state.request_id,
         user_id=user.id if user else None,
         action=action,
         entity_type=entity_type,
         entity_id=entity_id,
+        context_import_batch_id=context_import_batch_id,
         before_data=before_data,
         after_data=after_data,
         reason=reason,

@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 
 
 TEST_DB_PATH = Path(__file__).parent / "test.db"
+TEST_IMPORT_DIR = Path(__file__).parent / "uploaded-imports"
 os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_PATH.as_posix()}"
+os.environ["IMPORT_STORAGE_DIR"] = str(TEST_IMPORT_DIR)
 os.environ["SECRET_KEY"] = "test-secret-key-with-more-than-thirty-two-characters"
 os.environ["APP_ENV"] = "test"
 
@@ -26,6 +28,10 @@ def reset_database():
     Base.metadata.drop_all(engine)
     engine.dispose()
     TEST_DB_PATH.unlink(missing_ok=True)
+    if TEST_IMPORT_DIR.exists():
+        for uploaded_file in TEST_IMPORT_DIR.iterdir():
+            uploaded_file.unlink(missing_ok=True)
+        TEST_IMPORT_DIR.rmdir()
 
 
 @pytest.fixture

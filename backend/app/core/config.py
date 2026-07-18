@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     initial_admin_username: str = "admin"
     initial_admin_password: str | None = None
     cors_origins: str | None = None
+    import_max_file_size_mb: int = 64
+    import_storage_dir: str = "./data/imports"
 
     @model_validator(mode="after")
     def validate_runtime_safety(self) -> "Settings":
@@ -49,6 +51,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() == "production"
+
+    @property
+    def import_max_file_size_bytes(self) -> int:
+        return self.import_max_file_size_mb * 1024 * 1024
 
 
 @lru_cache
