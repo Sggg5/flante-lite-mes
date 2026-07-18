@@ -1,13 +1,13 @@
 # 福兰特轻量生产计划执行系统
 
-面向不锈钢管材、管件制造企业的轻型 MES。阶段 1 已建立 Vue 3 前端、FastAPI 后端、JWT 身份验证、RBAC/审计基础表、数据库迁移、测试与 Docker Compose 骨架。
+面向不锈钢管材、管件制造企业的轻型 MES。阶段 2 已在阶段 1 工程、认证、RBAC 和审计基础上建立 Excel 数据导入中心。
 
-当前明确不包含 Excel 导入、补库计算、生产需求业务、排产和报工功能；对应菜单仅为占位路由。
+当前支持销售出货、实时库存、水管在制、管件在制、常规排产产品和现有周计划的上传、分析、映射、预览、校验、确认、问题下载及受控撤销。仍明确不包含补库建议计算、生产需求池、正式排产、工序任务和生产报工。
 
 ## 技术栈
 
 - 前端：Vue 3、TypeScript、Vite、Element Plus、Pinia、Vue Router、Vitest。
-- 后端：Python 3.12、FastAPI、SQLAlchemy 2、Pydantic 2、Alembic、pytest。
+- 后端：Python 3.12、FastAPI、SQLAlchemy 2、Pydantic 2、Alembic、openpyxl、pytest。
 - 数据库：Windows 本地开发默认 SQLite；Docker/生产配置预留 PostgreSQL 16。
 - 部署：Docker Compose，Nginx 托管前端并代理 API。
 
@@ -15,8 +15,8 @@
 
 ```text
 flante-lite-mes/
-├─ backend/                 FastAPI、SQLAlchemy、Alembic、pytest
-├─ frontend/                Vue 3、登录页、主布局和占位路由
+├─ backend/                 FastAPI、SQLAlchemy、Alembic、Excel解析和pytest
+├─ frontend/                Vue 3、登录、主布局和数据导入中心
 ├─ docs/                    阶段分析、设计与完成报告
 ├─ compose.yaml             PostgreSQL、后端、前端
 ├─ .env.example             环境变量模板，不含真实密钥
@@ -133,6 +133,7 @@ npm.cmd run build
 ```
 
 阶段 1 的实际执行结果见 [阶段 1 完成报告](docs/phase-1-foundation-report.md)。
+阶段 2 的范围、测试与人工验收见 [阶段 2 完成报告](docs/phase-2-excel-import-report.md)。
 
 ## 健康检查与认证接口
 
@@ -143,6 +144,13 @@ npm.cmd run build
 | GET | `/api/v1/auth/me` | 当前用户、角色和权限 |
 | PUT | `/api/v1/users/{id}/roles` | ADMIN 权限修改用户角色并写审计 |
 | GET | `/api/v1/users/permission-check` | 权限依赖的 401/403 骨架验证 |
+| POST | `/api/v1/imports/upload` | 安全上传 `.xlsx` 并建立批次 |
+| GET/POST | `/api/v1/imports/{id}/sheets`、`/analyze` | 工作表与真实范围分析 |
+| GET/PUT | `/api/v1/imports/{id}/preview`、`/mapping` | 预览与字段映射 |
+| POST | `/api/v1/imports/{id}/validate` | 全量校验，不写业务表 |
+| POST | `/api/v1/imports/{id}/confirm` | 事务确认导入 |
+| POST | `/api/v1/imports/{id}/rollback` | 撤销未被后续业务引用的批次 |
+| GET | `/api/v1/imports`、`/{id}`、`/{id}/issues` | 批次、详情与问题查询 |
 
 所有请求响应带 `X-Request-ID`；认证和授权错误返回稳定的 `code`、`message`、`details` 和 `request_id`。密码只保存 Argon2 哈希，不进入 API 或审计日志。
 
@@ -167,3 +175,14 @@ npm.cmd run build
 - `X-Request-ID` 会规范化为最多 64 位，且只允许字母、数字、短横线和下划线；非法值在进入审计日志前自动替换为 UUID。
 - CI 会运行后端测试和 Alembic 升降级检查、前端类型检查/测试/构建，并真实启动 Docker Compose 做健康检查和登录冒烟测试。
 - 测试数据脱敏规则见 [docs/脱敏测试数据规则.md](docs/脱敏测试数据规则.md)，不得提交真实 Excel 或未脱敏生产数据。
+
+## 阶段 2：Excel 导入中心
+
+- 上传文件只允许 `.xlsx`，默认限制 20 MB；服务端使用随机安全文件标识并计算 SHA-256，不使用原文件名作为路径。
+- `openpyxl` 负责工作簿、公式、合并区域和单元格类型处理；服务端按连续空行截断真实数据范围，不遍历百万格式残留行。
+- 上传和分析不会写正式快照表；只有状态为 `READY` 且没有错误行的批次可以事务确认。
+- 产品编码以字符串保存；文本前导零保留，科学计数法和数值歧义会进入问题列表。
+- 库存可用量统一复算为 `现存 + 预计入库 - 预计出库`；Excel 原值只用于差异警告。
+- 负出货/在制数量保留原值并产生警告；不会在阶段 2 自动改为 0。
+- `ADMIN` 拥有全部导入权限，`PLANNER` 可查看/上传/校验/确认，`VIEWER` 只读，`FOREMAN` 默认无导入权限。
+- 测试工作簿由 pytest 或 CI 使用 openpyxl 动态生成，仓库忽略所有 `.xlsx` 文件。

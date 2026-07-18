@@ -9,13 +9,21 @@ DEFAULT_PERMISSIONS = {
     "system.view": "查看系统",
     "user.manage": "管理用户与角色",
     "audit.view": "查看审计日志",
+    "import.view": "查看导入批次",
+    "import.upload": "上传导入文件",
+    "import.validate": "分析并校验导入数据",
+    "import.confirm": "确认导入数据",
+    "import.rollback": "撤销导入批次",
 }
 
 DEFAULT_ROLES = {
     "ADMIN": ("系统管理员", set(DEFAULT_PERMISSIONS)),
-    "PLANNER": ("生产计划员", {"system.view"}),
+    "PLANNER": (
+        "生产计划员",
+        {"system.view", "import.view", "import.upload", "import.validate", "import.confirm"},
+    ),
     "FOREMAN": ("班组长", {"system.view"}),
-    "VIEWER": ("只读用户", {"system.view"}),
+    "VIEWER": ("只读用户", {"system.view", "import.view"}),
 }
 
 

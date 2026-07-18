@@ -14,6 +14,7 @@ htmlcov/
 backend/data/
 *.db
 *.sqlite3
+*.xlsx
 
 # Node
 frontend/node_modules/

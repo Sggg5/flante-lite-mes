@@ -3,11 +3,12 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import MainLayout from '../layouts/MainLayout.vue'
 import DashboardView from '../views/DashboardView.vue'
 import LoginView from '../views/LoginView.vue'
+import ImportCenterView from '../views/ImportCenterView.vue'
 import PlaceholderView from '../views/PlaceholderView.vue'
 import { TOKEN_STORAGE_KEY } from '../api/http'
 
 const placeholderRoutes: RouteRecordRaw[] = [
-  { path: 'imports', name: 'imports', component: PlaceholderView, meta: { title: '数据导入' } },
+  { path: 'imports', name: 'imports', component: ImportCenterView, meta: { title: '数据导入' } },
   { path: 'replenishment', name: 'replenishment', component: PlaceholderView, meta: { title: '补库管理' } },
   { path: 'demands', name: 'demands', component: PlaceholderView, meta: { title: '生产需求' } },
   { path: 'planning', name: 'planning', component: PlaceholderView, meta: { title: '生产计划' } },

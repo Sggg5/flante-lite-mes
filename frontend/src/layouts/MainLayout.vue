@@ -53,7 +53,7 @@ onMounted(async () => {
           <span>{{ item.label }}</span>
         </el-menu-item>
       </el-menu>
-      <div class="phase-label">PHASE 1 · FOUNDATION</div>
+      <div class="phase-label">PHASE 2 · EXCEL IMPORT</div>
     </el-aside>
 
     <el-container>
