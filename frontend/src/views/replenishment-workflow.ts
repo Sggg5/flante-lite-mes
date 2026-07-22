@@ -1,3 +1,12 @@
+
+export function getLocalDateString(): string {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
 export const REPLENISHMENT_WIZARD_STEPS = [
   '选择计算日期', '选择销售批次', '选择库存批次', '选择水管在制',
   '选择管件在制', '选择常规产品', '选择周计划', '选择默认算法',

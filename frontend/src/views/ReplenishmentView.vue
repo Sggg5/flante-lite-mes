@@ -5,7 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { listImports, type ImportBatch } from '../api/imports'
 import { approveRun, bulkReviewSuggestions, calculateRun, convertSuggestions, createRun, describeReplenishmentError, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, searchReplenishmentProducts, reviewSuggestion, updateScheduledOverride, type ProductOption, type ReplenishmentIssue, type ReplenishmentRun, type ReplenishmentSuggestion } from '../api/replenishment'
 import { useAuthStore } from '../stores/auth'
-import { REPLENISHMENT_WIZARD_STEPS, canConvertSuggestion, issueActionMode } from './replenishment-workflow'
+import { REPLENISHMENT_WIZARD_STEPS, canConvertSuggestion, getLocalDateString, issueActionMode } from './replenishment-workflow'
 
 const auth = useAuthStore()
 const loading = ref(false)
@@ -18,7 +18,7 @@ const selectedSuggestions = ref<ReplenishmentSuggestion[]>([])
 const wizardVisible = ref(false)
 const wizardStep = ref(0)
 const sourceOptions = reactive<Record<string, ImportBatch[]>>({})
-const form = reactive({ calculation_date: '2026-07-15', shipment_batch_id: undefined as number | undefined, inventory_batch_id: undefined as number | undefined, pipe_wip_batch_id: undefined as number | undefined, fitting_wip_batch_id: undefined as number | undefined, regular_product_batch_id: undefined as number | undefined, weekly_plan_batch_id: undefined as number | undefined })
+const form = reactive({ calculation_date: getLocalDateString(), shipment_batch_id: undefined as number | undefined, inventory_batch_id: undefined as number | undefined, pipe_wip_batch_id: undefined as number | undefined, fitting_wip_batch_id: undefined as number | undefined, regular_product_batch_id: undefined as number | undefined, weekly_plan_batch_id: undefined as number | undefined })
 const defaultAlgorithm = ref('SIX_MONTH_MAX')
 const defaultWeights = ref('0.05,0.05,0.10,0.15,0.25,0.40')
 const defaultFixedTargetQty = ref('')
@@ -33,6 +33,15 @@ const suggestionDetail = ref<(ReplenishmentSuggestion & { issues?: Replenishment
 const scheduledOverrideVisible = ref(false)
 const scheduledOverrideSuggestion = ref<(ReplenishmentSuggestion & { issues?: ReplenishmentIssue[] }) | null>(null)
 const scheduledOverrideForm = reactive({ qty: '0', reason: '' })
+const runPage = ref(1)
+const runPageSize = ref(20)
+const runTotal = ref(0)
+const suggestionPage = ref(1)
+const suggestionPageSize = ref(50)
+const suggestionTotal = ref(0)
+const issuePage = ref(1)
+const issuePageSize = ref(50)
+const issueTotal = ref(0)
 
 const canCalculate = computed(() => auth.hasPermission('replenishment.run.create') && auth.hasPermission('replenishment.run.calculate'))
 const canReview = computed(() => auth.hasPermission('replenishment.review'))
@@ -42,7 +51,10 @@ const convertible = computed(() => selectedSuggestions.value.filter(item => canC
 
 async function refreshRuns() {
   loading.value = true
-  try { runs.value = (await listRuns({ status: filters.status || undefined })).items }
+  try {
+    const resp = await listRuns({ status: filters.status || undefined, page: runPage.value, page_size: runPageSize.value })
+    runs.value = resp.items; runTotal.value = resp.total
+  }
   finally { loading.value = false }
 }
 
@@ -81,8 +93,15 @@ async function nextStep() {
 
 async function openRun(run: ReplenishmentRun) {
   selectedRun.value = run
-  suggestions.value = (await listSuggestions(run.id, { keyword: filters.keyword || undefined, review_status: filters.review_status || undefined, positive_only: positiveOnly.value })).items
-  issues.value = (await listRunIssues(run.id)).items
+  suggestionPage.value = 1; issuePage.value = 1
+  selectedSuggestions.value = []
+  const sugResp = await listSuggestions(run.id, {
+    keyword: filters.keyword || undefined, review_status: filters.review_status || undefined,
+    positive_only: positiveOnly.value, page: suggestionPage.value, page_size: suggestionPageSize.value,
+  })
+  suggestions.value = sugResp.items; suggestionTotal.value = sugResp.total
+  const issResp = await listRunIssues(run.id, { page: issuePage.value, page_size: issuePageSize.value })
+  issues.value = issResp.items; issueTotal.value = issResp.total
 }
 
 async function searchProducts(keyword: string) { productOptions.value = keyword ? (await searchReplenishmentProducts(keyword)).items : [] }
@@ -159,6 +178,38 @@ async function approveCurrentRun() {
 }
 
 onMounted(refreshRuns)
+
+async function handleRunPageChange(page: number) {
+  runPage.value = page
+  await refreshRuns()
+}
+
+async function handleSuggestionPageChange(page: number) {
+  suggestionPage.value = page
+  selectedSuggestions.value = []
+  if (selectedRun.value) {
+    const resp = await listSuggestions(selectedRun.value.id, {
+      keyword: filters.keyword || undefined, review_status: filters.review_status || undefined,
+      positive_only: positiveOnly.value, page: suggestionPage.value, page_size: suggestionPageSize.value,
+    })
+    suggestions.value = resp.items; suggestionTotal.value = resp.total
+  }
+}
+
+async function handleIssuePageChange(page: number) {
+  issuePage.value = page
+  if (selectedRun.value) {
+    const resp = await listRunIssues(selectedRun.value.id, { page: issuePage.value, page_size: issuePageSize.value })
+    issues.value = resp.items; issueTotal.value = resp.total
+  }
+}
+
+function handleSuggestionSizeChange(size: number) {
+  suggestionPageSize.value = size
+  suggestionPage.value = 1
+  handleSuggestionPageChange(1)
+}
+
 </script>
 
 <template>
@@ -172,6 +223,11 @@ onMounted(refreshRuns)
       <el-table v-loading="loading" :data="runs" @row-click="openRun">
         <el-table-column prop="run_no" label="运行编号" min-width="190" /><el-table-column prop="calculation_date" label="计算日期" width="120" /><el-table-column label="快照日期" width="120"><template #default="{ row }">{{ row.source_date_summary?.inventory ?? '-' }}</template></el-table-column><el-table-column prop="default_algorithm" label="默认算法" width="160" /><el-table-column prop="status" label="状态" width="170" /><el-table-column prop="total_products" label="产品" width="80" /><el-table-column prop="positive_suggestion_count" label="正数建议" width="90" /><el-table-column prop="pending_review_count" label="待审核" width="90" /><el-table-column prop="converted_count" label="已转换" width="90" /><el-table-column prop="warning_count" label="警告" width="75" /><el-table-column prop="blocking_issue_count" label="阻断" width="75" /><el-table-column prop="created_by" label="创建人" width="85" /><el-table-column prop="created_at" label="创建时间" width="170" />
       </el-table>
+      <el-pagination v-if="runTotal > 0" v-model:current-page="runPage" :page-size="runPageSize" :total="runTotal" layout="total, prev, pager, next" size="small" @current-change="handleRunPageChange" />
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">
+        <span style="color:#909399;font-size:13px">??? {{ selectedSuggestions.length }} ?</span>
+        <el-pagination v-if="suggestionTotal > 0" v-model:current-page="suggestionPage" :page-size="suggestionPageSize" :page-sizes="[50,100,200]" :total="suggestionTotal" layout="total, sizes, prev, pager, next, jumper" @size-change="handleSuggestionSizeChange" @current-change="handleSuggestionPageChange" />
+      </div>
     </el-card>
 
     <el-card v-if="selectedRun" shadow="never" class="suggestions-card">
@@ -180,6 +236,10 @@ onMounted(refreshRuns)
       <el-table v-if="issues.length" :data="issues" size="small" class="issue-table"><el-table-column prop="severity" label="级别" width="100"/><el-table-column prop="issue_code" label="问题代码" width="230"/><el-table-column prop="message" label="说明" min-width="300"/><el-table-column prop="status" label="状态" width="100"/><el-table-column v-if="auth.hasPermission('replenishment.review')" label="处理" width="170"><template #default="{row}"><el-button v-if="row.status === 'OPEN' && issueActionMode(row.issue_code, row.severity) === 'SCHEDULED_OVERRIDE'" link type="primary" @click="openScheduledOverride(row)">填写已排覆盖</el-button><el-button v-else-if="row.status === 'OPEN' && issueActionMode(row.issue_code, row.severity) === 'ACKNOWLEDGE'" link @click="handleIssue(row,'RESOLVE')">确认知悉</el-button><el-button v-else-if="row.status === 'OPEN' && issueActionMode(row.issue_code, row.severity) === 'RELEASE' && (row.issue_code !== 'SHIPMENT_WINDOW_INCOMPLETE' || auth.user?.roles.includes('ADMIN'))" link type="warning" @click="handleIssue(row,'IGNORE')">填写依据并放行</el-button><span v-else-if="row.status === 'OPEN'">{{ row.issue_code === 'SHIPMENT_WINDOW_INCOMPLETE' ? '仅管理员可放行' : '请按提示修正来源' }}</span></template></el-table-column></el-table>
       <el-form inline><el-input v-model="filters.keyword" placeholder="产品编码/名称/规格" clearable style="width:230px" /><el-select v-model="filters.review_status" clearable placeholder="审核状态" style="width:150px"><el-option v-for="value in ['PENDING','ACCEPTED','ADJUSTED','REJECTED','NOT_REQUIRED','CONVERTED']" :key="value" :value="value" /></el-select><el-switch v-model="positiveOnly" active-text="只看正数建议" inactive-text="查看全部"/><el-button @click="openRun(selectedRun)">查询</el-button></el-form>
       <el-table :data="suggestions" row-key="id" @row-click="openSuggestionDetail" @selection-change="selectionChanged"><el-table-column type="selection" width="46" /><el-table-column prop="product_code" label="产品编码" fixed width="150" /><el-table-column prop="product_name" label="名称" fixed width="150" /><el-table-column prop="specification" label="规格" width="140" /><el-table-column label="六个月销量" min-width="260"><template #default="{ row }"><span class="month-values">{{ Object.values(row.monthly_shipments).join(' / ') }}</span></template></el-table-column><el-table-column prop="target_stock_qty" label="目标库存" width="110" /><el-table-column prop="on_hand_qty" label="现存" width="90" /><el-table-column prop="expected_inbound_qty" label="预计入库" width="95" /><el-table-column prop="expected_outbound_qty" label="预计出库" width="95" /><el-table-column prop="available_qty" label="可用库存" width="110" /><el-table-column prop="pipe_wip_effective_qty" label="水管在制" width="100" /><el-table-column prop="fitting_wip_effective_qty" label="管件在制" width="100" /><el-table-column prop="scheduled_not_started_qty" label="已排未开" width="100" /><el-table-column prop="system_suggested_qty" label="系统建议" width="110" /><el-table-column prop="confirmed_qty" label="确认量" width="100" /><el-table-column prop="review_status" label="审核状态" width="110" /><el-table-column v-if="canReview" label="操作" fixed="right" width="90"><template #default="{ row }"><el-button link type="primary" @click.stop="approveOne(row)">审核</el-button></template></el-table-column></el-table>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">
+        <span style="color:#909399;font-size:13px">??? {{ selectedSuggestions.length }} ?</span>
+        <el-pagination v-if="suggestionTotal > 0" v-model:current-page="suggestionPage" :page-size="suggestionPageSize" :page-sizes="[50,100,200]" :total="suggestionTotal" layout="total, sizes, prev, pager, next, jumper" @size-change="handleSuggestionSizeChange" @current-change="handleSuggestionPageChange" />
+      </div>
     </el-card>
 
     <el-drawer v-model="detailVisible" title="补库建议计算明细" size="620px">

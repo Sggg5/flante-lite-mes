@@ -34,7 +34,7 @@ export interface ProductionDemand {
   required_date: string | null; status: string; created_at: string
 }
 
-export interface ReplenishmentIssue { id: number; issue_code: string; severity: string; message: string; status: string; product_id: number | null; details: Record<string, unknown> | null }
+export interface ReplenishmentIssue { id: number; run_id: number | null; suggestion_id: number | null; issue_code: string; severity: string; message: string; status: string; product_id: number | null; details: Record<string, unknown> | null }
 export interface ProductOption { id: number; product_code: string; product_name: string | null; specification: string | null }
 
 export function describeReplenishmentError(error: unknown): string {
@@ -67,8 +67,8 @@ export async function getSuggestion(suggestionId: number) {
   return (await http.get<ReplenishmentSuggestion & { issues: ReplenishmentIssue[] }>(`/v1/replenishment/suggestions/${suggestionId}`)).data
 }
 
-export async function listRunIssues(runId: number) {
-  return (await http.get<{ items: ReplenishmentIssue[]; total: number }>(`/v1/replenishment/runs/${runId}/issues`)).data
+export async function listRunIssues(runId: number, params: Record<string, unknown> = {}) {
+  return (await http.get<{ items: ReplenishmentIssue[]; total: number }>(`/v1/replenishment/runs/${runId}/issues`, { params })).data
 }
 
 export async function resolveRunIssue(runId: number, issueId: number, action: 'RESOLVE' | 'IGNORE', reason: string) {

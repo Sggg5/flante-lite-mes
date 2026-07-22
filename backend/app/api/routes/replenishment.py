@@ -12,7 +12,7 @@ from app.core.database import get_db
 from app.core.errors import error_payload
 from app.models import (
     AuditLog, ImportBatch, Product, ProductionDemand, RegularProductionProduct, ReplenishmentIssue, ReplenishmentOrderInput,
-    ReplenishmentPolicy, ReplenishmentRun, ReplenishmentSuggestion, User,
+    ReplenishmentPolicy, ReplenishmentRun, ReplenishmentSuggestion, User, WeeklyPlanStagingRow,
 )
 from app.schemas.replenishment import (
     ApproveRunRequest, BulkPolicyRequest, BulkReviewRequest, CalculateRunRequest, ConvertSuggestionsRequest,
@@ -199,7 +199,21 @@ def source_batches(import_type: str | None = None, db: Session = Depends(get_db)
         if import_type not in allowed: return {"items": []}
         query = query.where(ImportBatch.import_type == import_type)
     items = db.scalars(query.order_by(ImportBatch.confirmed_at.desc(), ImportBatch.id.desc()).limit(500)).all()
-    return {"items": [{"id": item.id, "batch_no": item.batch_no, "import_type": item.import_type, "source_date": item.source_date, "imported_rows": item.imported_rows, "confirmed_at": item.confirmed_at} for item in items]}
+    result = []
+    for item in items:
+        entry = {"id": item.id, "batch_no": item.batch_no, "import_type": item.import_type, "source_date": item.source_date, "imported_rows": item.imported_rows, "confirmed_at": item.confirmed_at}
+        if item.import_type == "WEEKLY_PLAN":
+            total = db.scalar(func.count(WeeklyPlanStagingRow.id).filter(WeeklyPlanStagingRow.import_batch_id == item.id)) or 0
+            matched = db.scalar(func.count(WeeklyPlanStagingRow.id).filter(WeeklyPlanStagingRow.import_batch_id == item.id, WeeklyPlanStagingRow.match_status == "MATCHED")) or 0
+            ignored = db.scalar(func.count(WeeklyPlanStagingRow.id).filter(WeeklyPlanStagingRow.import_batch_id == item.id, WeeklyPlanStagingRow.match_status == "IGNORED")) or 0
+            incomplete = total - matched - ignored
+            entry["total_staging_rows"] = total
+            entry["matched_rows"] = matched
+            entry["ignored_rows"] = ignored
+            entry["incomplete_rows"] = incomplete
+            entry["matching_complete"] = incomplete == 0
+        result.append(entry)
+    return {"items": result}
 
 
 @router.post("/runs/validate-sources")

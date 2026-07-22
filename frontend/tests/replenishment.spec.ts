@@ -1,10 +1,10 @@
-import { flushPromises, mount } from '@vue/test-utils'
+﻿import { flushPromises, mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, vi } from 'vitest'
 
 import http from '../src/api/http'
-import { approveRun, bulkReviewSuggestions, calculateRun, cancelProductionDemand, convertSuggestions, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, reviewSuggestion, updateScheduledOverride, REPLENISHMENT_REQUEST_TIMEOUT_MS } from '../src/api/replenishment'
+import { approveRun, bulkReviewSuggestions, calculateRun, cancelProductionDemand, convertSuggestions, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, reviewSuggestion, updateScheduledOverride, type ReplenishmentIssue, REPLENISHMENT_REQUEST_TIMEOUT_MS } from '../src/api/replenishment'
 import { useAuthStore } from '../src/stores/auth'
 import ProductionDemandView from '../src/views/ProductionDemandView.vue'
 import ReplenishmentView from '../src/views/ReplenishmentView.vue'
@@ -128,7 +128,7 @@ describe('phase 3 replenishment UI', () => {
       scheduled_override_qty: '0', scheduled_not_started_qty: '100', system_suggested_qty: '500',
       confirmed_qty: null, review_status: 'PENDING',
     }
-    const issue = { id: 8, issue_code: 'SCHEDULED_ACTUAL_UNKNOWN', severity: 'BLOCKING', message: '实际量未知', status: 'OPEN', product_id: 9, details: null }
+    const issue: ReplenishmentIssue = { id: 8, run_id: 3, suggestion_id: 7, issue_code: 'SCHEDULED_ACTUAL_UNKNOWN', severity: 'BLOCKING', message: '实际量未知', status: 'OPEN', product_id: 9, details: null }
     vi.mocked(listRuns).mockResolvedValueOnce({ items: [run] as never[], total: 1 })
     vi.mocked(listSuggestions).mockResolvedValue({ items: [suggestion] as never[], total: 1 })
     vi.mocked(listRunIssues).mockResolvedValue({ items: [issue], total: 1 })
@@ -160,3 +160,4 @@ describe('phase 3 replenishment UI', () => {
     expect(wrapper.text()).toContain('不创建排产任务')
   })
 })
+
