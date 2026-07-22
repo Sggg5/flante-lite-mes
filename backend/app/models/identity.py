@@ -96,6 +96,9 @@ class AuditLog(Base, TimestampMixin):
     context_import_batch_id: Mapped[int | None] = mapped_column(
         ForeignKey("import_batches.id", ondelete="SET NULL"), index=True
     )
+    context_replenishment_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("replenishment_runs.id", ondelete="SET NULL"), index=True
+    )
     before_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     after_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     reason: Mapped[str | None] = mapped_column(Text)

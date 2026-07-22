@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import event, func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import engine
 from app.core.security import hash_password
@@ -11,6 +12,7 @@ from app.models import (
     AuditLog, FittingWipSnapshot, ImportBatch, ImportedWeeklyPlanRaw, InventorySnapshot, PipeWipSnapshot,
     Product, ProductionDemand, RegularProductionProduct, ReplenishmentIssue,
     ReplenishmentRun, ReplenishmentSuggestion, Role, ShipmentRecord, User, UserRole,
+    WeeklyPlanStagingRow,
 )
 from app.services.replenishment import (
     aggregate_shipments, calculate_metrics, calculate_suggestion, calculate_target,
@@ -463,3 +465,298 @@ def test_concurrent_conversion_creates_only_one_demand(client, db, admin_token):
             ProductionDemand.source_suggestion_id == suggestion.id
         )
     ) == 1
+
+
+def create_planner_token(client, db) -> str:
+    role = db.scalar(select(Role).where(Role.code == "PLANNER"))
+    planner = User(username="phase3-planner", display_name="阶段三计划员", password_hash=hash_password("PlannerTest123!"))
+    planner.role_links.append(UserRole(role=role))
+    db.add(planner)
+    db.commit()
+    return client.post(
+        "/api/v1/auth/login",
+        json={"username": "phase3-planner", "password": "PlannerTest123!"},
+    ).json()["access_token"]
+
+
+def test_issue_resolution_policy_rejects_generic_business_bypasses(client, db, admin_token):
+    sources = source_fixture(db, products=2)
+    missing_product = sources["products"][1]
+    db.query(InventorySnapshot).filter(InventorySnapshot.product_id == missing_product.id).delete()
+    db.commit()
+    client.put(
+        f"/api/v1/replenishment/policies/{sources['products'][0].id}",
+        json={"algorithm": "ORDER_BASED", "rounding_mode": "NONE", "reason": "订单策略"},
+        headers=auth(admin_token),
+    )
+    weekly = batch(db, "WEEKLY_PLAN", 61, date(2026, 7, 13))
+    db.add(WeeklyPlanStagingRow(
+        product_name_raw="虚拟待匹配", specification_raw="VIRTUAL-SPEC", production_batch_no="VIRTUAL-LOT",
+        process_name="包装", equipment_name="虚拟设备", plan_start_date=date(2026, 7, 13),
+        plan_end_date=date(2026, 7, 19), daily_plan={}, daily_actual={}, weekly_plan_qty=10,
+        weekly_actual_qty=None, formula_metadata={}, match_status="UNMATCHED", **imported_kwargs(weekly.id, 8),
+    ))
+    db.commit()
+    run_id = create_run(client, admin_token, sources, weekly_plan_batch_id=weekly.id).json()["id"]
+    assert client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token)).status_code == 200
+    expected = {
+        "INVENTORY_SNAPSHOT_MISSING": "ISSUE_REQUIRES_SOURCE_CORRECTION",
+        "ORDER_INPUT_REQUIRED": "ISSUE_REQUIRES_ORDER_INPUT",
+        "SCHEDULED_ROWS_UNMATCHED": "ISSUE_REQUIRES_WEEKLY_PLAN_MATCHING",
+    }
+    for issue_code, error_code in expected.items():
+        issue = db.scalar(select(ReplenishmentIssue).where(
+            ReplenishmentIssue.run_id == run_id, ReplenishmentIssue.issue_code == issue_code,
+        ))
+        response = client.post(
+            f"/api/v1/replenishment/runs/{run_id}/issues/{issue.id}",
+            json={"action": "IGNORE", "reason": "不得通用绕过"}, headers=auth(admin_token),
+        )
+        assert response.status_code == 409
+        assert response.json()["code"] == error_code
+
+
+def test_unknown_actual_only_uses_dedicated_override_and_refreshes_counters(client, db, admin_token):
+    sources = source_fixture(db)
+    product = sources["products"][0]
+    weekly = batch(db, "WEEKLY_PLAN", 62, date(2026, 7, 13))
+    db.add(ImportedWeeklyPlanRaw(
+        product_id=product.id, production_batch_no="VIRTUAL-WEEK-UNKNOWN", process_name="包装",
+        equipment_name="虚拟设备", plan_start_date=date(2026, 7, 13), plan_end_date=date(2026, 7, 19),
+        planned_quantity=250, actual_quantity=None, daily_plan={}, daily_actual={}, **imported_kwargs(weekly.id, 9),
+    ))
+    db.commit()
+    run_id = create_run(client, admin_token, sources, weekly_plan_batch_id=weekly.id).json()["id"]
+    client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token))
+    suggestion = db.scalar(select(ReplenishmentSuggestion).where(ReplenishmentSuggestion.run_id == run_id))
+    issue = db.scalar(select(ReplenishmentIssue).where(
+        ReplenishmentIssue.suggestion_id == suggestion.id,
+        ReplenishmentIssue.issue_code == "SCHEDULED_ACTUAL_UNKNOWN",
+    ))
+    generic = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/issues/{issue.id}",
+        json={"action": "RESOLVE", "reason": "错误入口"}, headers=auth(admin_token),
+    )
+    assert generic.status_code == 409
+    assert generic.json()["code"] == "ISSUE_REQUIRES_SCHEDULED_OVERRIDE"
+    reviewed = client.patch(
+        f"/api/v1/replenishment/suggestions/{suggestion.id}",
+        json={"action": "APPROVE", "confirmed_qty": "325", "reason": "覆盖前临时审核"},
+        headers=auth(admin_token),
+    )
+    assert reviewed.status_code == 200
+    dedicated = client.put(
+        f"/api/v1/replenishment/suggestions/{suggestion.id}/scheduled-override",
+        json={"scheduled_override_qty": "150", "reason": "现场核对后覆盖"}, headers=auth(admin_token),
+    )
+    assert dedicated.status_code == 200
+    db.refresh(suggestion)
+    db.refresh(issue)
+    run = db.get(ReplenishmentRun, run_id)
+    assert issue.status == "RESOLVED"
+    assert suggestion.review_status == "PENDING" and suggestion.confirmed_qty is None
+    assert run.blocking_issue_count == 0 and run.pending_review_count == 1
+
+
+def test_planner_cannot_admin_override_but_can_release_snapshot_mismatch(client, db, admin_token):
+    sources = source_fixture(db, complete_coverage=False, mismatch=True)
+    planner_token = create_planner_token(client, db)
+    planner_run = create_run(client, planner_token, sources, force_duplicate=True, force_reason="不应使用")
+    assert planner_run.status_code == 403
+    run_id = create_run(client, admin_token, sources).json()["id"]
+    forbidden = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/calculate",
+        json={"override_blocking_checks": True, "override_reason": "计划员尝试覆盖"},
+        headers=auth(planner_token),
+    )
+    assert forbidden.status_code == 403
+    assert forbidden.json()["code"] == "REPLENISHMENT_OVERRIDE_ADMIN_REQUIRED"
+    assert client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token)).status_code == 200
+    shipment_issue = db.scalar(select(ReplenishmentIssue).where(
+        ReplenishmentIssue.run_id == run_id, ReplenishmentIssue.issue_code == "SHIPMENT_WINDOW_INCOMPLETE",
+    ))
+    mismatch_issue = db.scalar(select(ReplenishmentIssue).where(
+        ReplenishmentIssue.run_id == run_id, ReplenishmentIssue.issue_code == "SNAPSHOT_DATE_MISMATCH",
+    ))
+    planner_shipment = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/issues/{shipment_issue.id}",
+        json={"action": "IGNORE", "reason": "计划员不得放行"}, headers=auth(planner_token),
+    )
+    assert planner_shipment.status_code == 403
+    released = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/issues/{mismatch_issue.id}",
+        json={"action": "IGNORE", "reason": "已核对三类实际快照日期"}, headers=auth(planner_token),
+    )
+    assert released.status_code == 200
+    assert released.json()["details"]["manual_override"] is True
+    assert released.json()["details"]["override_actor_id"] is not None
+    admin_release = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/issues/{shipment_issue.id}",
+        json={"action": "IGNORE", "reason": "管理员确认销售窗口不足仍放行"}, headers=auth(admin_token),
+    )
+    assert admin_release.status_code == 200
+    assert db.get(ReplenishmentRun, run_id).blocking_issue_count == 0
+    override_run_id = create_run(
+        client, admin_token, sources, calculation_date="2026-07-16"
+    ).json()["id"]
+    overridden = client.post(
+        f"/api/v1/replenishment/runs/{override_run_id}/calculate",
+        json={"override_blocking_checks": True, "override_reason": "管理员确认允许项降级"},
+        headers=auth(admin_token),
+    )
+    assert overridden.status_code == 200
+    downgraded = list(db.scalars(select(ReplenishmentIssue).where(
+        ReplenishmentIssue.run_id == override_run_id,
+        ReplenishmentIssue.issue_code.in_(["SHIPMENT_WINDOW_INCOMPLETE", "SNAPSHOT_DATE_MISMATCH"]),
+    )))
+    assert {item.severity for item in downgraded} == {"WARNING"}
+    assert all(item.details["original_severity"] == "BLOCKING" for item in downgraded)
+    assert all(item.details["override_actor_id"] == 1 for item in downgraded)
+
+
+def test_warning_acknowledgement_does_not_change_calculation_snapshot(client, db, admin_token):
+    sources = source_fixture(db)
+    shipment = db.scalar(select(ShipmentRecord).order_by(ShipmentRecord.id))
+    shipment.quantity = -1
+    db.commit()
+    run_id = create_run(client, admin_token, sources).json()["id"]
+    client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token))
+    run = db.get(ReplenishmentRun, run_id)
+    fingerprint, snapshot = run.input_fingerprint, dict(run.source_snapshot)
+    issue = db.scalar(select(ReplenishmentIssue).where(
+        ReplenishmentIssue.run_id == run_id, ReplenishmentIssue.issue_code == "NEGATIVE_SHIPMENT_QUANTITY",
+    ))
+    response = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/issues/{issue.id}",
+        json={"action": "IGNORE", "reason": "已知悉负数销售"}, headers=auth(admin_token),
+    )
+    assert response.status_code == 200 and response.json()["status"] == "RESOLVED"
+    db.refresh(run)
+    assert run.input_fingerprint == fingerprint and run.source_snapshot == snapshot
+
+
+def test_weekly_plan_content_is_frozen_and_referenced_matching_is_blocked(client, db, admin_token):
+    sources = source_fixture(db)
+    product = sources["products"][0]
+    weekly = batch(db, "WEEKLY_PLAN", 63, date(2026, 7, 13))
+    staging = WeeklyPlanStagingRow(
+        product_name_raw="虚拟产品", specification_raw="VIRTUAL-SPEC", production_batch_no="VIRTUAL-FROZEN",
+        process_name="包装", equipment_name="虚拟设备", plan_start_date=date(2026, 7, 13),
+        plan_end_date=date(2026, 7, 19), daily_plan={"2026-07-13": "100"}, daily_actual={"2026-07-13": "20"},
+        weekly_plan_qty=100, weekly_actual_qty=20, formula_metadata={}, match_status="UNMATCHED",
+        **imported_kwargs(weekly.id, 11),
+    )
+    db.add(staging)
+    db.commit()
+    matched = client.post(
+        f"/api/v1/imports/{weekly.id}/weekly-plan-staging/{staging.id}/match",
+        json={"action": "MATCH", "product_id": product.id, "reason": "虚拟人工匹配"},
+        headers=auth(admin_token),
+    )
+    assert matched.status_code == 200
+    raw = db.scalar(select(ImportedWeeklyPlanRaw).where(
+        ImportedWeeklyPlanRaw.import_batch_id == weekly.id,
+        ImportedWeeklyPlanRaw.source_row_number == staging.source_row_number,
+    ))
+    run_id = create_run(client, admin_token, sources, weekly_plan_batch_id=weekly.id).json()["id"]
+    run = db.get(ReplenishmentRun, run_id)
+    original_fingerprint = run.input_fingerprint
+    detail = client.get(f"/api/v1/replenishment/runs/{run_id}", headers=auth(admin_token)).json()
+    assert "weekly_plan.match" in {item["action"] for item in detail["audit_logs"]}
+    blocked = client.post(
+        f"/api/v1/imports/{weekly.id}/weekly-plan-staging/{staging.id}/match",
+        json={"action": "IGNORE", "reason": "引用后不得修改"}, headers=auth(admin_token),
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["code"] == "WEEKLY_PLAN_REFERENCED_BY_REPLENISHMENT"
+    raw.actual_quantity = 30
+    db.commit()
+    changed = client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token))
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "REPLENISHMENT_SOURCE_CHANGED"
+    db.refresh(run)
+    assert run.input_fingerprint == original_fingerprint
+    client.post(f"/api/v1/replenishment/runs/{run_id}/cancel", json={"reason": "取消旧运行"}, headers=auth(admin_token))
+    still_blocked = client.post(
+        f"/api/v1/imports/{weekly.id}/weekly-plan-staging/{staging.id}/match",
+        json={"action": "IGNORE", "reason": "取消后仍冻结"}, headers=auth(admin_token),
+    )
+    assert still_blocked.status_code == 409
+
+
+def test_concurrent_identical_run_creation_creates_only_one_active_run(client, db, admin_token):
+    sources = source_fixture(db)
+    def create_once():
+        return create_run(client, admin_token, sources)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: create_once(), range(2)))
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    rejected = next(response for response in responses if response.status_code == 409)
+    assert rejected.json()["code"] == "REPLENISHMENT_RUN_DUPLICATE"
+    assert db.scalar(select(func.count(ReplenishmentRun.id)).where(
+        ReplenishmentRun.status.in_(["DRAFT", "CALCULATING", "READY_FOR_REVIEW"])
+    )) == 1
+
+
+def test_quantity_database_constraints_reject_invalid_values(db):
+    sources = source_fixture(db)
+    run = ReplenishmentRun(
+        run_no="RR-CONSTRAINT", calculation_date=date(2026, 7, 15), shipment_batch_id=sources["shipment"].id,
+        inventory_batch_id=sources["inventory"].id, pipe_wip_batch_id=sources["pipe"].id,
+        fitting_wip_batch_id=sources["fitting"].id, regular_product_batch_id=sources["regular"].id,
+        input_fingerprint="f" * 64, default_algorithm="SIX_MONTH_MAX", rounding_mode="NONE",
+        default_min_batch_qty=Decimal("-1"), source_snapshot={}, source_date_summary={}, calculation_config={}, created_by=1,
+    )
+    db.add(run)
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+
+def test_run_counters_and_audit_chain_follow_review_reopen_convert_and_cancel(client, db, admin_token):
+    sources = source_fixture(db)
+    run_id = create_run(client, admin_token, sources).json()["id"]
+    client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token))
+    suggestion = db.scalar(select(ReplenishmentSuggestion).where(ReplenishmentSuggestion.run_id == run_id))
+    run = db.get(ReplenishmentRun, run_id)
+    db.refresh(run)
+    assert (run.total_products, run.suggestion_count, run.positive_suggestion_count) == (1, 1, 1)
+    assert (run.pending_review_count, run.reviewed_count, run.approved_count) == (1, 0, 0)
+    client.patch(
+        f"/api/v1/replenishment/suggestions/{suggestion.id}",
+        json={"action": "APPROVE", "reason": "接受建议"}, headers=auth(admin_token),
+    )
+    db.refresh(run)
+    assert (run.pending_review_count, run.reviewed_count, run.approved_count) == (0, 1, 1)
+    client.patch(
+        f"/api/v1/replenishment/suggestions/{suggestion.id}",
+        json={"action": "RETURN", "reason": "重新审核"}, headers=auth(admin_token),
+    )
+    db.refresh(run)
+    assert (run.pending_review_count, run.reviewed_count, run.approved_count) == (1, 0, 0)
+    client.patch(
+        f"/api/v1/replenishment/suggestions/{suggestion.id}",
+        json={"action": "APPROVE", "reason": "再次接受"}, headers=auth(admin_token),
+    )
+    assert approve_run(client, admin_token, run_id).status_code == 200
+    converted = client.post(
+        f"/api/v1/replenishment/runs/{run_id}/convert",
+        json={"suggestion_ids": [suggestion.id], "reason": "转换需求"}, headers=auth(admin_token),
+    )
+    assert converted.status_code == 200
+    demand_id = converted.json()["items"][0]["id"]
+    db.refresh(run)
+    assert run.converted_count == 1 and run.status == "CONVERTED"
+    cancelled = client.post(
+        f"/api/v1/production-demands/{demand_id}/cancel",
+        json={"reason": "取消虚拟需求"}, headers=auth(admin_token),
+    )
+    assert cancelled.status_code == 200
+    db.refresh(run)
+    assert run.converted_count == 1 and run.status == "CONVERTED"
+    detail = client.get(f"/api/v1/replenishment/runs/{run_id}", headers=auth(admin_token)).json()
+    actions = {item["action"] for item in detail["audit_logs"]}
+    assert {
+        "replenishment.run.create", "replenishment.run.calculate", "replenishment.suggestion.review",
+        "replenishment.run.approve", "replenishment.suggestions.convert", "production_demand.cancel",
+    } <= actions

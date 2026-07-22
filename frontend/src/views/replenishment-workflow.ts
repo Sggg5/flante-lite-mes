@@ -13,3 +13,12 @@ export function weightsAreValid(values: string): boolean {
   return weights.length === 6 && weights.every(value => Number.isFinite(value) && value >= 0)
     && Math.abs(weights.reduce((total, value) => total + value, 0) - 1) <= 0.000001
 }
+
+export type IssueActionMode = 'SCHEDULED_OVERRIDE' | 'ACKNOWLEDGE' | 'RELEASE' | 'NONE'
+
+export function issueActionMode(issueCode: string, severity: string): IssueActionMode {
+  if (issueCode === 'SCHEDULED_ACTUAL_UNKNOWN') return 'SCHEDULED_OVERRIDE'
+  if (['SNAPSHOT_DATE_MISMATCH', 'SHIPMENT_WINDOW_INCOMPLETE'].includes(issueCode)) return 'RELEASE'
+  if (['INVENTORY_SNAPSHOT_MISSING', 'ORDER_INPUT_REQUIRED', 'SCHEDULED_ROWS_UNMATCHED', 'SNAPSHOT_DATE_IN_FUTURE'].includes(issueCode)) return 'NONE'
+  return ['WARNING', 'INFO'].includes(severity) ? 'ACKNOWLEDGE' : 'NONE'
+}

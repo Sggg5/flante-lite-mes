@@ -218,6 +218,53 @@ jobs:
           curl --fail --show-error --max-time 600 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "{\"suggestion_ids\":[$suggestion_id],\"reason\":\"CI转生产需求\"}" "http://localhost:8080/api/v1/replenishment/runs/$run_id/convert" | jq -e '.items | length == 1' >/dev/null
           curl --fail --show-error --max-time 600 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "{\"suggestion_ids\":[$suggestion_id],\"reason\":\"CI重复转换幂等验证\"}" "http://localhost:8080/api/v1/replenishment/runs/$run_id/convert" | jq -e '.items | length == 1' >/dev/null
           curl --fail --show-error -H "Authorization: Bearer $token" 'http://localhost:8080/api/v1/production-demands' | jq -e '(.items[0].confirmed_qty | tonumber) == 500 and .items[0].status == "PENDING_SCHEDULE"' >/dev/null
+          docker compose exec -T backend python - <<'PY'
+          from app.core.database import SessionLocal
+          from app.core.security import hash_password
+          from app.models import Role, User, UserRole
+          from sqlalchemy import select
+          with SessionLocal() as db:
+              if db.scalar(select(User).where(User.username == "ci-planner")) is None:
+                  role = db.scalar(select(Role).where(Role.code == "PLANNER"))
+                  user = User(username="ci-planner", display_name="CI虚拟计划员", password_hash=hash_password("PlannerTest123!"))
+                  user.role_links.append(UserRole(role=role)); db.add(user); db.commit()
+          PY
+          planner_token="$(curl --fail --show-error -H 'Content-Type: application/json' -d '{"username":"ci-planner","password":"PlannerTest123!"}' http://localhost:8080/api/v1/auth/login | jq -r '.access_token')"
+          planner_run="$(curl --fail --show-error -H "Authorization: Bearer $planner_token" -H 'Content-Type: application/json' -d "{\"calculation_date\":\"2026-07-16\",\"shipment_batch_id\":$shipment_id,\"inventory_batch_id\":$inventory_id,\"pipe_wip_batch_id\":$pipe_id,\"fitting_wip_batch_id\":$fitting_id,\"regular_product_batch_id\":$regular_id}" http://localhost:8080/api/v1/replenishment/runs)"
+          planner_run_id="$(echo "$planner_run" | jq -r '.id')"
+          planner_override_status="$(curl --silent --show-error -o /tmp/planner-override.json -w '%{http_code}' -H "Authorization: Bearer $planner_token" -H 'Content-Type: application/json' -d '{"override_blocking_checks":true,"override_reason":"CI计划员不得覆盖"}' "http://localhost:8080/api/v1/replenishment/runs/$planner_run_id/calculate")"
+          test "$planner_override_status" = "403"
+          jq -e '.code == "REPLENISHMENT_OVERRIDE_ADMIN_REQUIRED"' /tmp/planner-override.json
+          weekly_info="$(docker compose exec -T backend python - <<'PY'
+          from datetime import UTC, date, datetime
+          from decimal import Decimal
+          from sqlalchemy import select
+          from app.core.database import SessionLocal
+          from app.models import ImportBatch, ImportedWeeklyPlanRaw, Product, WeeklyPlanStagingRow
+          with SessionLocal() as db:
+              product = db.scalar(select(Product).where(Product.product_code == "CI-REPLENISH-001"))
+              batch = ImportBatch(batch_no="CI-WEEKLY-FROZEN", import_type="WEEKLY_PLAN", original_filename="ci-weekly-virtual.xlsx", stored_filename="ci-weekly-virtual.xlsx", file_sha256="9" * 64, source_date=date(2026, 7, 13), file_size=100, status="COMPLETED", imported_rows=1, created_by=1, confirmed_by=1, confirmed_at=datetime.now(UTC), import_options={})
+              db.add(batch); db.flush()
+              common = dict(import_batch_id=batch.id, source_sheet="CI虚拟周计划", source_row_number=2, raw_data={"virtual": True})
+              db.add(ImportedWeeklyPlanRaw(product_id=product.id, production_batch_no="CI-WEEK-LOT", process_name="包装", equipment_name="CI虚拟设备", plan_start_date=date(2026, 7, 13), plan_end_date=date(2026, 7, 19), planned_quantity=Decimal("250"), actual_quantity=None, daily_plan={}, daily_actual={}, **common))
+              staging = WeeklyPlanStagingRow(product_name_raw="CI虚拟补库产品", specification_raw="CI-SPEC", production_batch_no="CI-WEEK-LOT", process_name="包装", equipment_name="CI虚拟设备", plan_start_date=date(2026, 7, 13), plan_end_date=date(2026, 7, 19), daily_plan={}, daily_actual={}, weekly_plan_qty=Decimal("250"), weekly_actual_qty=None, formula_metadata={}, match_status="MATCHED", matched_product_id=product.id, matched_by=1, matched_at=datetime.now(UTC), match_reason="CI虚拟人工匹配", **common)
+              db.add(staging); db.commit(); print(batch.id, staging.id)
+          PY
+          )"
+          weekly_id="$(echo "$weekly_info" | tail -1 | awk '{print $1}')"
+          staging_id="$(echo "$weekly_info" | tail -1 | awk '{print $2}')"
+          weekly_run="$(curl --fail --show-error -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "{\"calculation_date\":\"2026-07-17\",\"shipment_batch_id\":$shipment_id,\"inventory_batch_id\":$inventory_id,\"pipe_wip_batch_id\":$pipe_id,\"fitting_wip_batch_id\":$fitting_id,\"regular_product_batch_id\":$regular_id,\"weekly_plan_batch_id\":$weekly_id}" http://localhost:8080/api/v1/replenishment/runs)"
+          weekly_run_id="$(echo "$weekly_run" | jq -r '.id')"
+          curl --fail --show-error --max-time 600 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{}' "http://localhost:8080/api/v1/replenishment/runs/$weekly_run_id/calculate" >/dev/null
+          weekly_suggestion="$(curl --fail --show-error -H "Authorization: Bearer $token" "http://localhost:8080/api/v1/replenishment/suggestions?run_id=$weekly_run_id" | jq -r '.items[0].id')"
+          unknown_issue="$(curl --fail --show-error -H "Authorization: Bearer $token" "http://localhost:8080/api/v1/replenishment/runs/$weekly_run_id/issues" | jq -r '.items[] | select(.issue_code == "SCHEDULED_ACTUAL_UNKNOWN") | .id')"
+          generic_status="$(curl --silent --show-error -o /tmp/generic-unknown.json -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"action":"IGNORE","reason":"CI不得通用绕过"}' "http://localhost:8080/api/v1/replenishment/runs/$weekly_run_id/issues/$unknown_issue")"
+          test "$generic_status" = "409"
+          jq -e '.code == "ISSUE_REQUIRES_SCHEDULED_OVERRIDE"' /tmp/generic-unknown.json
+          curl --fail --show-error -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"scheduled_override_qty":"150","reason":"CI现场确认覆盖"}' "http://localhost:8080/api/v1/replenishment/suggestions/$weekly_suggestion/scheduled-override" | jq -e '.review_status == "PENDING" and (.confirmed_qty == null)' >/dev/null
+          match_status="$(curl --silent --show-error -o /tmp/weekly-reference.json -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"action":"IGNORE","reason":"CI引用后禁止修改"}' "http://localhost:8080/api/v1/imports/$weekly_id/weekly-plan-staging/$staging_id/match")"
+          test "$match_status" = "409"
+          jq -e '.code == "WEEKLY_PLAN_REFERENCED_BY_REPLENISHMENT"' /tmp/weekly-reference.json
           rollback_status="$(curl --silent --show-error -o /tmp/replenishment-reference.json -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"reason":"CI引用保护"}' "http://localhost:8080/api/v1/imports/$inventory_id/rollback")"
           test "$rollback_status" = "409"
           jq -e '.code == "IMPORT_BATCH_REFERENCED_BY_REPLENISHMENT"' /tmp/replenishment-reference.json

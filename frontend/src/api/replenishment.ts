@@ -22,6 +22,7 @@ export interface ReplenishmentSuggestion {
   expected_inbound_qty: string; expected_outbound_qty: string; available_qty: string
   pipe_wip_raw_qty: string; pipe_wip_effective_qty: string
   fitting_wip_raw_qty: string; fitting_wip_effective_qty: string; scheduled_not_started_qty: string
+  scheduled_known_qty: string; scheduled_override_qty: string
   system_suggested_qty: string; confirmed_qty: string | null; review_status: string
 }
 
@@ -72,6 +73,13 @@ export async function listRunIssues(runId: number) {
 
 export async function resolveRunIssue(runId: number, issueId: number, action: 'RESOLVE' | 'IGNORE', reason: string) {
   return (await http.post(`/v1/replenishment/runs/${runId}/issues/${issueId}`, { action, reason })).data
+}
+
+export async function updateScheduledOverride(suggestionId: number, qty: string, reason: string) {
+  return (await http.put<ReplenishmentSuggestion>(
+    `/v1/replenishment/suggestions/${suggestionId}/scheduled-override`,
+    { scheduled_override_qty: qty, reason },
+  )).data
 }
 
 export async function searchReplenishmentProducts(keyword: string) {

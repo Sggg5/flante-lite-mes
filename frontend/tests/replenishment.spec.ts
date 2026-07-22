@@ -1,14 +1,14 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, vi } from 'vitest'
 
 import http from '../src/api/http'
-import { approveRun, bulkReviewSuggestions, calculateRun, cancelProductionDemand, convertSuggestions, resolveRunIssue, reviewSuggestion, REPLENISHMENT_REQUEST_TIMEOUT_MS } from '../src/api/replenishment'
+import { approveRun, bulkReviewSuggestions, calculateRun, cancelProductionDemand, convertSuggestions, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, reviewSuggestion, updateScheduledOverride, REPLENISHMENT_REQUEST_TIMEOUT_MS } from '../src/api/replenishment'
 import { useAuthStore } from '../src/stores/auth'
 import ProductionDemandView from '../src/views/ProductionDemandView.vue'
 import ReplenishmentView from '../src/views/ReplenishmentView.vue'
-import { canConvertSuggestion, REPLENISHMENT_WIZARD_STEPS, weightsAreValid } from '../src/views/replenishment-workflow'
+import { canConvertSuggestion, issueActionMode, REPLENISHMENT_WIZARD_STEPS, weightsAreValid } from '../src/views/replenishment-workflow'
 
 vi.mock('../src/api/replenishment', async (importOriginal) => {
   const original = await importOriginal<typeof import('../src/api/replenishment')>()
@@ -16,6 +16,8 @@ vi.mock('../src/api/replenishment', async (importOriginal) => {
     ...original,
     listRuns: vi.fn().mockResolvedValue({ items: [], total: 0 }),
     listSuggestions: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+    listRunIssues: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+    getSuggestion: vi.fn(),
     listProductionDemands: vi.fn().mockResolvedValue({ items: [], total: 0 }),
   }
 })
@@ -76,6 +78,18 @@ describe('phase 3 replenishment UI', () => {
     post.mockRestore()
   })
 
+  it('uses the dedicated scheduled override endpoint and excludes it from generic resolution', async () => {
+    expect(issueActionMode('SCHEDULED_ACTUAL_UNKNOWN', 'BLOCKING')).toBe('SCHEDULED_OVERRIDE')
+    expect(issueActionMode('INVENTORY_SNAPSHOT_MISSING', 'BLOCKING')).toBe('NONE')
+    expect(issueActionMode('NEGATIVE_WIP_CLAMPED', 'WARNING')).toBe('ACKNOWLEDGE')
+    const put = vi.spyOn(http, 'put').mockResolvedValue({ data: { id: 7 } })
+    await updateScheduledOverride(7, '150', '现场确认未知实际量')
+    expect(put).toHaveBeenCalledWith('/v1/replenishment/suggestions/7/scheduled-override', {
+      scheduled_override_qty: '150', reason: '现场确认未知实际量',
+    })
+    put.mockRestore()
+  })
+
   it('uses a distinct run approval action before conversion', async () => {
     const post = vi.spyOn(http, 'post').mockResolvedValue({ data: {} })
     await approveRun(3, '审核完成')
@@ -104,6 +118,37 @@ describe('phase 3 replenishment UI', () => {
     await Promise.resolve()
     expect(wrapper.text()).toContain('补库计算与建议中心')
     expect(wrapper.text()).not.toContain('新建补库计算')
+  })
+
+  it('renders a dedicated unknown-actual override action without generic resolve or ignore', async () => {
+    const run = { id: 3, run_no: 'RR-VIRTUAL', calculation_date: '2026-07-15', status: 'READY_FOR_REVIEW' }
+    const suggestion = {
+      id: 7, run_id: 3, product_id: 9, product_code: 'VIRTUAL-00009', product_name: '虚拟产品',
+      specification: 'VIRTUAL-SPEC', monthly_shipments: {}, scheduled_known_qty: '100',
+      scheduled_override_qty: '0', scheduled_not_started_qty: '100', system_suggested_qty: '500',
+      confirmed_qty: null, review_status: 'PENDING',
+    }
+    const issue = { id: 8, issue_code: 'SCHEDULED_ACTUAL_UNKNOWN', severity: 'BLOCKING', message: '实际量未知', status: 'OPEN', product_id: 9, details: null }
+    vi.mocked(listRuns).mockResolvedValueOnce({ items: [run] as never[], total: 1 })
+    vi.mocked(listSuggestions).mockResolvedValue({ items: [suggestion] as never[], total: 1 })
+    vi.mocked(listRunIssues).mockResolvedValue({ items: [issue], total: 1 })
+    vi.mocked(getSuggestion).mockResolvedValue({ ...suggestion, issues: [issue] } as never)
+    const pinia = createPinia(); setActivePinia(pinia)
+    useAuthStore().user = { id: 2, username: 'planner', display_name: '计划员', roles: ['PLANNER'], permissions: ['replenishment.view', 'replenishment.review'] }
+    const wrapper = mount(ReplenishmentView, { attachTo: document.body, global: { plugins: [pinia, ElementPlus] } })
+    await flushPromises()
+    const firstRow = wrapper.find('.el-table__body-wrapper tbody tr')
+    expect(firstRow.exists()).toBe(true)
+    await firstRow.trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('填写已排覆盖')
+    expect(wrapper.text()).not.toContain('解决忽略')
+    const button = wrapper.findAll('button').find(item => item.text().includes('填写已排覆盖'))
+    await button?.trigger('click')
+    await flushPromises()
+    expect(document.body.textContent).toContain('周计划实际量未知')
+    expect(document.body.textContent).toContain('已知已排未开工')
+    wrapper.unmount()
   })
 
   it('renders minimal demand pool without scheduling controls', async () => {

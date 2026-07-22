@@ -3,9 +3,9 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { listImports, type ImportBatch } from '../api/imports'
-import { approveRun, bulkReviewSuggestions, calculateRun, convertSuggestions, createRun, describeReplenishmentError, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, searchReplenishmentProducts, reviewSuggestion, type ProductOption, type ReplenishmentIssue, type ReplenishmentRun, type ReplenishmentSuggestion } from '../api/replenishment'
+import { approveRun, bulkReviewSuggestions, calculateRun, convertSuggestions, createRun, describeReplenishmentError, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, searchReplenishmentProducts, reviewSuggestion, updateScheduledOverride, type ProductOption, type ReplenishmentIssue, type ReplenishmentRun, type ReplenishmentSuggestion } from '../api/replenishment'
 import { useAuthStore } from '../stores/auth'
-import { REPLENISHMENT_WIZARD_STEPS, canConvertSuggestion } from './replenishment-workflow'
+import { REPLENISHMENT_WIZARD_STEPS, canConvertSuggestion, issueActionMode } from './replenishment-workflow'
 
 const auth = useAuthStore()
 const loading = ref(false)
@@ -30,6 +30,9 @@ const filters = reactive({ status: '', keyword: '', review_status: '' })
 const positiveOnly = ref(true)
 const detailVisible = ref(false)
 const suggestionDetail = ref<(ReplenishmentSuggestion & { issues?: ReplenishmentIssue[] }) | null>(null)
+const scheduledOverrideVisible = ref(false)
+const scheduledOverrideSuggestion = ref<(ReplenishmentSuggestion & { issues?: ReplenishmentIssue[] }) | null>(null)
+const scheduledOverrideForm = reactive({ qty: '0', reason: '' })
 
 const canCalculate = computed(() => auth.hasPermission('replenishment.run.create') && auth.hasPermission('replenishment.run.calculate'))
 const canReview = computed(() => auth.hasPermission('replenishment.review'))
@@ -91,6 +94,32 @@ async function handleIssue(issue: ReplenishmentIssue, action: 'RESOLVE' | 'IGNOR
   await openRun(selectedRun.value)
 }
 
+async function openScheduledOverride(issue: ReplenishmentIssue) {
+  const suggestion = suggestions.value.find(item => item.product_id === issue.product_id)
+  if (!suggestion) return ElMessage.error('未找到该问题对应的补库建议')
+  scheduledOverrideSuggestion.value = await getSuggestion(suggestion.id)
+  scheduledOverrideForm.qty = scheduledOverrideSuggestion.value.scheduled_override_qty ?? '0'
+  scheduledOverrideForm.reason = ''
+  scheduledOverrideVisible.value = true
+}
+
+async function submitScheduledOverride() {
+  if (!scheduledOverrideSuggestion.value || !selectedRun.value) return
+  processing.value = true
+  try {
+    const updated = await updateScheduledOverride(
+      scheduledOverrideSuggestion.value.id,
+      scheduledOverrideForm.qty,
+      scheduledOverrideForm.reason,
+    )
+    scheduledOverrideVisible.value = false
+    await openRun(selectedRun.value)
+    if (suggestionDetail.value?.id === updated.id) suggestionDetail.value = await getSuggestion(updated.id)
+    ElMessage.success('已重新计算系统建议量，审核状态已重置')
+  } catch (error) { ElMessage.error(describeReplenishmentError(error)) }
+  finally { processing.value = false }
+}
+
 function selectionChanged(rows: ReplenishmentSuggestion[]) { selectedSuggestions.value = rows }
 async function openSuggestionDetail(row: ReplenishmentSuggestion) {
   suggestionDetail.value = await getSuggestion(row.id)
@@ -148,7 +177,7 @@ onMounted(refreshRuns)
     <el-card v-if="selectedRun" shadow="never" class="suggestions-card">
       <template #header><div class="card-title"><strong>{{ selectedRun.run_no }} · 建议明细</strong><div><el-button v-if="canReview" @click="bulkApprove">批量接受</el-button><el-button v-if="canApprove" type="success" @click="approveCurrentRun">批准运行</el-button><el-button v-if="canConvert" type="primary" :loading="processing" @click="convertSelected">转生产需求</el-button></div></div></template>
       <el-alert v-if="issues.some(item => item.status === 'OPEN')" :title="`当前有 ${issues.filter(item => item.status === 'OPEN').length} 个待处理问题`" type="warning" :closable="false" show-icon />
-      <el-table v-if="issues.length" :data="issues" size="small" class="issue-table"><el-table-column prop="severity" label="级别" width="100"/><el-table-column prop="issue_code" label="问题代码" width="230"/><el-table-column prop="message" label="说明" min-width="300"/><el-table-column prop="status" label="状态" width="100"/><el-table-column v-if="auth.hasPermission('replenishment.review')" label="处理" width="130"><template #default="{row}"><el-button link @click="handleIssue(row,'RESOLVE')">解决</el-button><el-button link @click="handleIssue(row,'IGNORE')">忽略</el-button></template></el-table-column></el-table>
+      <el-table v-if="issues.length" :data="issues" size="small" class="issue-table"><el-table-column prop="severity" label="级别" width="100"/><el-table-column prop="issue_code" label="问题代码" width="230"/><el-table-column prop="message" label="说明" min-width="300"/><el-table-column prop="status" label="状态" width="100"/><el-table-column v-if="auth.hasPermission('replenishment.review')" label="处理" width="170"><template #default="{row}"><el-button v-if="row.status === 'OPEN' && issueActionMode(row.issue_code, row.severity) === 'SCHEDULED_OVERRIDE'" link type="primary" @click="openScheduledOverride(row)">填写已排覆盖</el-button><el-button v-else-if="row.status === 'OPEN' && issueActionMode(row.issue_code, row.severity) === 'ACKNOWLEDGE'" link @click="handleIssue(row,'RESOLVE')">确认知悉</el-button><el-button v-else-if="row.status === 'OPEN' && issueActionMode(row.issue_code, row.severity) === 'RELEASE' && (row.issue_code !== 'SHIPMENT_WINDOW_INCOMPLETE' || auth.user?.roles.includes('ADMIN'))" link type="warning" @click="handleIssue(row,'IGNORE')">填写依据并放行</el-button><span v-else-if="row.status === 'OPEN'">{{ row.issue_code === 'SHIPMENT_WINDOW_INCOMPLETE' ? '仅管理员可放行' : '请按提示修正来源' }}</span></template></el-table-column></el-table>
       <el-form inline><el-input v-model="filters.keyword" placeholder="产品编码/名称/规格" clearable style="width:230px" /><el-select v-model="filters.review_status" clearable placeholder="审核状态" style="width:150px"><el-option v-for="value in ['PENDING','ACCEPTED','ADJUSTED','REJECTED','NOT_REQUIRED','CONVERTED']" :key="value" :value="value" /></el-select><el-switch v-model="positiveOnly" active-text="只看正数建议" inactive-text="查看全部"/><el-button @click="openRun(selectedRun)">查询</el-button></el-form>
       <el-table :data="suggestions" row-key="id" @row-click="openSuggestionDetail" @selection-change="selectionChanged"><el-table-column type="selection" width="46" /><el-table-column prop="product_code" label="产品编码" fixed width="150" /><el-table-column prop="product_name" label="名称" fixed width="150" /><el-table-column prop="specification" label="规格" width="140" /><el-table-column label="六个月销量" min-width="260"><template #default="{ row }"><span class="month-values">{{ Object.values(row.monthly_shipments).join(' / ') }}</span></template></el-table-column><el-table-column prop="target_stock_qty" label="目标库存" width="110" /><el-table-column prop="on_hand_qty" label="现存" width="90" /><el-table-column prop="expected_inbound_qty" label="预计入库" width="95" /><el-table-column prop="expected_outbound_qty" label="预计出库" width="95" /><el-table-column prop="available_qty" label="可用库存" width="110" /><el-table-column prop="pipe_wip_effective_qty" label="水管在制" width="100" /><el-table-column prop="fitting_wip_effective_qty" label="管件在制" width="100" /><el-table-column prop="scheduled_not_started_qty" label="已排未开" width="100" /><el-table-column prop="system_suggested_qty" label="系统建议" width="110" /><el-table-column prop="confirmed_qty" label="确认量" width="100" /><el-table-column prop="review_status" label="审核状态" width="110" /><el-table-column v-if="canReview" label="操作" fixed="right" width="90"><template #default="{ row }"><el-button link type="primary" @click.stop="approveOne(row)">审核</el-button></template></el-table-column></el-table>
     </el-card>
@@ -172,6 +201,19 @@ onMounted(refreshRuns)
       <el-alert v-for="issue in suggestionDetail?.issues ?? []" :key="issue.id" :title="`${issue.issue_code}: ${issue.message}`" :type="issue.severity === 'BLOCKING' ? 'error' : 'warning'" :closable="false" show-icon class="detail-issue" />
     </el-drawer>
 
+    <el-dialog v-model="scheduledOverrideVisible" title="填写周计划已排数量覆盖" width="560px" :close-on-click-modal="!processing">
+      <el-alert title="周计划实际量未知。请根据现场确认填写额外的已排未开工数量；提交后系统建议量会重新计算，原审核结果与确认量会清除。" type="warning" :closable="false" show-icon />
+      <el-descriptions v-if="scheduledOverrideSuggestion" :column="1" border class="override-detail">
+        <el-descriptions-item label="产品">{{ scheduledOverrideSuggestion.product_code }} · {{ scheduledOverrideSuggestion.product_name }}</el-descriptions-item>
+        <el-descriptions-item label="已知已排未开工">{{ scheduledOverrideSuggestion.scheduled_known_qty }}</el-descriptions-item>
+      </el-descriptions>
+      <el-form label-width="140px">
+        <el-form-item label="覆盖数量"><el-input v-model="scheduledOverrideForm.qty" inputmode="decimal" /></el-form-item>
+        <el-form-item label="确认原因"><el-input v-model="scheduledOverrideForm.reason" type="textarea" :rows="3" placeholder="至少填写2个字符" /></el-form-item>
+      </el-form>
+      <template #footer><el-button :disabled="processing" @click="scheduledOverrideVisible=false">取消</el-button><el-button type="primary" :loading="processing" :disabled="scheduledOverrideForm.reason.trim().length < 2" @click="submitScheduledOverride">确认并重新计算</el-button></template>
+    </el-dialog>
+
     <el-dialog v-model="wizardVisible" title="新建补库计算" width="900px" :close-on-click-modal="!processing">
       <el-steps :active="wizardStep" finish-status="success" simple><el-step v-for="step in REPLENISHMENT_WIZARD_STEPS" :key="step" :title="step" /></el-steps>
       <div class="wizard-body">
@@ -194,5 +236,5 @@ onMounted(refreshRuns)
 </template>
 
 <style scoped>
-.business-page{display:grid;gap:18px}.page-actions,.card-title{display:flex;align-items:center;justify-content:space-between;gap:24px}.page-actions h2{margin:5px 0;font-size:26px}.page-actions p{margin:0;color:#6b7971}.section-kicker{color:#75914f;font-size:10px;font-weight:800;letter-spacing:.18em}.suggestions-card{margin-top:2px}.wizard-body{min-height:180px;display:grid;place-items:center;padding:38px 20px}.month-values{font-variant-numeric:tabular-nums;color:#52655b}.el-steps{overflow:auto}.issue-table{margin:14px 0}.order-inputs{display:grid;gap:12px;width:100%}.order-row{display:grid;grid-template-columns:2fr 1fr 2fr auto;gap:8px}
+.business-page{display:grid;gap:18px}.page-actions,.card-title{display:flex;align-items:center;justify-content:space-between;gap:24px}.page-actions h2{margin:5px 0;font-size:26px}.page-actions p{margin:0;color:#6b7971}.section-kicker{color:#75914f;font-size:10px;font-weight:800;letter-spacing:.18em}.suggestions-card{margin-top:2px}.wizard-body{min-height:180px;display:grid;place-items:center;padding:38px 20px}.month-values{font-variant-numeric:tabular-nums;color:#52655b}.el-steps{overflow:auto}.issue-table{margin:14px 0}.order-inputs{display:grid;gap:12px;width:100%}.order-row{display:grid;grid-template-columns:2fr 1fr 2fr auto;gap:8px}.override-detail{margin:16px 0}
 </style>

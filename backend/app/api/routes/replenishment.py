@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,7 +22,9 @@ from app.services.audit import write_audit_log
 from app.services.identity import get_role_codes
 from app.services.replenishment import (
     ACTIVE_RUN_STATUSES, ReplenishmentError, calculate_run, canonical_fingerprint,
-    convert_suggestions, make_run_no, refresh_run_status, source_fingerprint,
+    convert_suggestions, input_fingerprint_creation_lock, issue_resolution_policy,
+    make_run_no, refresh_run_counters, refresh_run_status, source_fingerprint,
+    weekly_plan_content_fingerprint,
 )
 
 
@@ -258,6 +260,11 @@ def create_run(
         "default_min_batch_qty": str(payload.default_min_batch_qty) if payload.default_min_batch_qty is not None else None,
     }
     snapshot["calculation_config"] = calculation_config
+    snapshot["formula_version"] = "PHASE3_V1"
+    if payload.weekly_plan_batch_id is not None:
+        snapshot["weekly_plan_content_fingerprint"] = weekly_plan_content_fingerprint(
+            db, payload.weekly_plan_batch_id
+        )
     regular_product_ids = select(RegularProductionProduct.product_id).where(RegularProductionProduct.import_batch_id == regular_batch_id)
     configured_policies = db.scalars(select(ReplenishmentPolicy).where(ReplenishmentPolicy.product_id.in_(regular_product_ids), ReplenishmentPolicy.is_active.is_(True))).all()
     snapshot["policies"] = {
@@ -270,39 +277,43 @@ def create_run(
         for policy in sorted(configured_policies, key=lambda item: item.product_id)
     }
     fingerprint = canonical_fingerprint(snapshot)
-    duplicate = db.scalar(select(ReplenishmentRun).where(ReplenishmentRun.input_fingerprint == fingerprint, ReplenishmentRun.status.in_(ACTIVE_RUN_STATUSES)).with_for_update())
-    if duplicate and not payload.force_duplicate:
-        fail(request, "REPLENISHMENT_RUN_DUPLICATE", "相同输入已经存在补库运行", {"run_id": duplicate.id})
     if payload.force_duplicate:
         if "ADMIN" not in get_role_codes(actor):
             fail(request, "ADMIN_FORCE_REQUIRED", "只有管理员可以强制创建重复运行", http_status=403)
         if not payload.force_reason or len(payload.force_reason.strip()) < 2:
             fail(request, "FORCE_REASON_REQUIRED", "强制创建重复运行必须填写原因", http_status=422)
-    run = ReplenishmentRun(
-        run_no=make_run_no(), calculation_date=payload.calculation_date,
-        shipment_batch_id=payload.shipment_batch_id, inventory_batch_id=payload.inventory_batch_id,
-        pipe_wip_batch_id=payload.pipe_wip_batch_id, fitting_wip_batch_id=payload.fitting_wip_batch_id,
-        regular_product_batch_id=regular_batch_id,
-        weekly_plan_batch_id=payload.weekly_plan_batch_id, input_fingerprint=fingerprint,
-        default_algorithm=payload.default_algorithm,
-        default_weight_config=[str(value) for value in payload.default_weight_config] if payload.default_weight_config else None,
-        default_fixed_target_qty=payload.default_fixed_target_qty,
-        rounding_mode=payload.rounding_mode, default_min_batch_qty=payload.default_min_batch_qty,
-        source_snapshot=snapshot, source_date_summary=source_dates, calculation_config=calculation_config,
-        override_reason=payload.force_reason, status="DRAFT", created_by=actor.id,
-    )
-    db.add(run)
-    db.flush()
-    seen: set[int] = set()
-    for item in payload.order_inputs:
-        if item.product_id in seen:
-            fail(request, "ORDER_INPUT_DUPLICATE", "同一产品不能重复填写订单输入", http_status=422)
-        seen.add(item.product_id)
-        if db.get(Product, item.product_id) is None:
-            fail(request, "PRODUCT_NOT_FOUND", "订单输入包含不存在的产品", http_status=404)
-        db.add(ReplenishmentOrderInput(run_id=run.id, product_id=item.product_id, order_qty=item.quantity, source_document_no=item.source_document_no, note=item.reason, created_by=actor.id))
-    write_audit_log(db, request, user=actor, action="replenishment.run.create", entity_type="replenishment_run", entity_id=str(run.id), after_data=run_dict(run), reason=payload.force_reason)
-    db.commit()
+    with input_fingerprint_creation_lock(db, fingerprint):
+        duplicate = db.scalar(select(ReplenishmentRun).where(
+            ReplenishmentRun.input_fingerprint == fingerprint,
+            ReplenishmentRun.status.in_(ACTIVE_RUN_STATUSES),
+        ).with_for_update())
+        if duplicate and not payload.force_duplicate:
+            fail(request, "REPLENISHMENT_RUN_DUPLICATE", "相同输入已经存在补库运行", {"run_id": duplicate.id})
+        run = ReplenishmentRun(
+            run_no=make_run_no(), calculation_date=payload.calculation_date,
+            shipment_batch_id=payload.shipment_batch_id, inventory_batch_id=payload.inventory_batch_id,
+            pipe_wip_batch_id=payload.pipe_wip_batch_id, fitting_wip_batch_id=payload.fitting_wip_batch_id,
+            regular_product_batch_id=regular_batch_id,
+            weekly_plan_batch_id=payload.weekly_plan_batch_id, input_fingerprint=fingerprint,
+            default_algorithm=payload.default_algorithm,
+            default_weight_config=[str(value) for value in payload.default_weight_config] if payload.default_weight_config else None,
+            default_fixed_target_qty=payload.default_fixed_target_qty,
+            rounding_mode=payload.rounding_mode, default_min_batch_qty=payload.default_min_batch_qty,
+            source_snapshot=snapshot, source_date_summary=source_dates, calculation_config=calculation_config,
+            override_reason=payload.force_reason, status="DRAFT", created_by=actor.id,
+        )
+        db.add(run)
+        db.flush()
+        seen: set[int] = set()
+        for item in payload.order_inputs:
+            if item.product_id in seen:
+                fail(request, "ORDER_INPUT_DUPLICATE", "同一产品不能重复填写订单输入", http_status=422)
+            seen.add(item.product_id)
+            if db.get(Product, item.product_id) is None:
+                fail(request, "PRODUCT_NOT_FOUND", "订单输入包含不存在的产品", http_status=404)
+            db.add(ReplenishmentOrderInput(run_id=run.id, product_id=item.product_id, order_qty=item.quantity, source_document_no=item.source_document_no, note=item.reason, created_by=actor.id))
+        write_audit_log(db, request, user=actor, action="replenishment.run.create", entity_type="replenishment_run", entity_id=str(run.id), after_data=run_dict(run), reason=payload.force_reason, context_replenishment_run_id=run.id)
+        db.commit()
     return run_dict(run)
 
 
@@ -311,11 +322,15 @@ def get_run_detail(run_id: int, request: Request, db: Session = Depends(get_db),
     run = get_run(db, request, run_id)
     result = run_dict(run)
     result["order_inputs"] = [{"product_id": item.product_id, "order_qty": item.order_qty, "source_document_no": item.source_document_no, "note": item.note} for item in db.scalars(select(ReplenishmentOrderInput).where(ReplenishmentOrderInput.run_id == run.id))]
-    suggestion_ids = [str(value) for value in db.scalars(select(ReplenishmentSuggestion.id).where(ReplenishmentSuggestion.run_id == run.id))]
-    audit_filter = (AuditLog.entity_type == "replenishment_run") & (AuditLog.entity_id == str(run.id))
-    if suggestion_ids:
-        audit_filter = audit_filter | ((AuditLog.entity_type == "replenishment_suggestion") & (AuditLog.entity_id.in_(suggestion_ids)))
-    logs = db.scalars(select(AuditLog).where(audit_filter).order_by(AuditLog.occurred_at.desc()).limit(500)).all()
+    audit_filters = [AuditLog.context_replenishment_run_id == run.id]
+    if run.weekly_plan_batch_id:
+        audit_filters.append(and_(
+            AuditLog.context_import_batch_id == run.weekly_plan_batch_id,
+            AuditLog.action == "weekly_plan.match",
+        ))
+    logs = db.scalars(select(AuditLog).where(
+        or_(*audit_filters)
+    ).order_by(AuditLog.occurred_at.desc()).limit(500)).all()
     result["audit_logs"] = [{"id": log.id, "action": log.action, "entity_type": log.entity_type, "entity_id": log.entity_id, "before_data": log.before_data, "after_data": log.after_data, "reason": log.reason, "request_id": log.request_id, "occurred_at": log.occurred_at} for log in logs]
     return result
 
@@ -330,7 +345,7 @@ def cancel_run(run_id: int, payload: CancelRequest, request: Request, db: Sessio
     before = run_dict(run)
     run.status = "CANCELLED"
     run.cancelled_by, run.cancelled_at, run.cancel_reason = actor.id, datetime.now(UTC), payload.reason
-    write_audit_log(db, request, user=actor, action="replenishment.run.cancel", entity_type="replenishment_run", entity_id=str(run.id), before_data=before, after_data=run_dict(run), reason=payload.reason)
+    write_audit_log(db, request, user=actor, action="replenishment.run.cancel", entity_type="replenishment_run", entity_id=str(run.id), before_data=before, after_data=run_dict(run), reason=payload.reason, context_replenishment_run_id=run.id)
     db.commit()
     return run_dict(run)
 
@@ -338,10 +353,37 @@ def cancel_run(run_id: int, payload: CancelRequest, request: Request, db: Sessio
 @router.post("/runs/{run_id}/calculate")
 def calculate(run_id: int, payload: CalculateRunRequest, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("replenishment.run.calculate"))) -> dict[str, Any]:
     run = get_run(db, request, run_id, lock=True)
+    if payload.override_blocking_checks and "ADMIN" not in get_role_codes(actor):
+        fail(request, "REPLENISHMENT_OVERRIDE_ADMIN_REQUIRED", "只有管理员可以覆盖允许放行的阻断检查", http_status=403)
     before = run_dict(run)
     try:
-        service_call(request, lambda: calculate_run(db, run, override=payload.override_blocking_checks, override_reason=payload.override_reason))
-        write_audit_log(db, request, user=actor, action="replenishment.run.calculate", entity_type="replenishment_run", entity_id=str(run.id), before_data=before, after_data=run_dict(run), reason=payload.override_reason)
+        service_call(request, lambda: calculate_run(
+            db, run,
+            override=payload.override_blocking_checks,
+            override_reason=payload.override_reason,
+            override_actor_id=actor.id,
+        ))
+        write_audit_log(db, request, user=actor, action="replenishment.run.calculate", entity_type="replenishment_run", entity_id=str(run.id), before_data=before, after_data=run_dict(run), reason=payload.override_reason, context_replenishment_run_id=run.id)
+        if payload.override_blocking_checks:
+            overridden_issues = list(db.scalars(select(ReplenishmentIssue).where(
+                ReplenishmentIssue.run_id == run.id,
+                ReplenishmentIssue.issue_code.in_(["SHIPMENT_WINDOW_INCOMPLETE", "SNAPSHOT_DATE_MISMATCH"]),
+            )))
+            write_audit_log(
+                db, request, user=actor, action="replenishment.run.admin_override",
+                entity_type="replenishment_run", entity_id=str(run.id),
+                before_data={"blocking_checks": "BLOCKING"},
+                after_data={
+                    "issues": [{
+                        "issue_code": item.issue_code,
+                        "original_severity": "BLOCKING",
+                        "downgraded_severity": item.severity,
+                    } for item in overridden_issues],
+                    "actor_id": actor.id,
+                },
+                reason=payload.override_reason,
+                context_replenishment_run_id=run.id,
+            )
         db.commit()
     except HTTPException as exc:
         error = {"code": exc.detail.get("code"), "message": exc.detail.get("message")} if isinstance(exc.detail, dict) else None
@@ -373,13 +415,24 @@ def resolve_issue(run_id: int, issue_id: int, payload: ResolveIssueRequest, requ
         fail(request, "REPLENISHMENT_STATE_INVALID", "当前运行状态不能处理问题")
     issue = db.scalar(select(ReplenishmentIssue).where(ReplenishmentIssue.id == issue_id, ReplenishmentIssue.run_id == run.id).with_for_update())
     if issue is None: fail(request, "REPLENISHMENT_ISSUE_NOT_FOUND", "补库问题不存在", http_status=404)
-    if issue.issue_code == "SNAPSHOT_DATE_IN_FUTURE":
-        fail(request, "FUTURE_SNAPSHOT_NOT_OVERRIDABLE", "未来日期快照禁止放行，请重新选择正确的数据批次")
+    policy = issue_resolution_policy(issue.issue_code, issue.severity)
+    mode = policy["mode"]
+    if mode in {"SOURCE_CORRECTION", "ORDER_INPUT", "WEEKLY_PLAN_MATCHING", "NOT_OVERRIDABLE", "SCHEDULED_OVERRIDE"}:
+        fail(request, policy["error_code"], "该问题必须通过指定业务流程处理，不能通用解决或忽略")
+    if mode == "ADMIN_OVERRIDE" and "ADMIN" not in get_role_codes(actor):
+        fail(request, "REPLENISHMENT_OVERRIDE_ADMIN_REQUIRED", "只有管理员可以放行销售窗口不完整问题", http_status=403)
     before = issue_dict(issue)
-    issue.status = "RESOLVED" if payload.action == "RESOLVE" else "IGNORED"
+    issue.status = "RESOLVED" if mode == "ACKNOWLEDGE" else "IGNORED"
     issue.resolved_by, issue.resolved_at, issue.resolution_note = actor.id, datetime.now(UTC), payload.reason
-    run.blocking_issue_count = db.scalar(select(func.count(ReplenishmentIssue.id)).where(ReplenishmentIssue.run_id == run.id, ReplenishmentIssue.severity == "BLOCKING", ReplenishmentIssue.status == "OPEN")) or 0
-    write_audit_log(db, request, user=actor, action="replenishment.issue.resolve", entity_type="replenishment_issue", entity_id=str(issue.id), before_data=before, after_data=issue_dict(issue), reason=payload.reason)
+    issue.details = {
+        **(issue.details or {}),
+        "resolution_policy": mode,
+        "manual_override": mode in {"PLANNER_OVERRIDE", "ADMIN_OVERRIDE"},
+        "override_actor_id": actor.id if mode in {"PLANNER_OVERRIDE", "ADMIN_OVERRIDE"} else None,
+        "override_reason": payload.reason if mode in {"PLANNER_OVERRIDE", "ADMIN_OVERRIDE"} else None,
+    }
+    refresh_run_counters(db, run)
+    write_audit_log(db, request, user=actor, action="replenishment.issue.resolve", entity_type="replenishment_issue", entity_id=str(issue.id), before_data=before, after_data=issue_dict(issue), reason=payload.reason, context_replenishment_run_id=run.id)
     db.commit()
     return issue_dict(issue)
 
@@ -437,7 +490,7 @@ def review_locked(db: Session, request: Request, run: ReplenishmentRun, suggesti
         else:
             item.confirmed_qty, item.review_status = None, "PENDING"
         item.reviewed_by, item.reviewed_at, item.review_reason, item.change_reason = actor.id, now, payload.reason, payload.reason
-        write_audit_log(db, request, user=actor, action="replenishment.suggestion.review", entity_type="replenishment_suggestion", entity_id=str(item.id), before_data=before, after_data=suggestion_dict(item), reason=payload.reason)
+        write_audit_log(db, request, user=actor, action="replenishment.suggestion.review", entity_type="replenishment_suggestion", entity_id=str(item.id), before_data=before, after_data=suggestion_dict(item), reason=payload.reason, context_replenishment_run_id=run.id)
     refresh_run_status(db, run)
 
 
@@ -492,8 +545,8 @@ def set_scheduled_override(suggestion_id: int, payload: ScheduledOverrideRequest
     issue = db.scalar(select(ReplenishmentIssue).where(ReplenishmentIssue.suggestion_id == suggestion.id, ReplenishmentIssue.issue_code == "SCHEDULED_ACTUAL_UNKNOWN", ReplenishmentIssue.status == "OPEN").with_for_update())
     if issue:
         issue.status, issue.resolved_by, issue.resolved_at, issue.resolution_note = "RESOLVED", actor.id, datetime.now(UTC), payload.reason
-    write_audit_log(db, request, user=actor, action="replenishment.scheduled_override", entity_type="replenishment_suggestion", entity_id=str(suggestion.id), before_data=before, after_data=suggestion_dict(suggestion), reason=payload.reason)
-    refresh_run_status(db, run)
+    write_audit_log(db, request, user=actor, action="replenishment.scheduled_override", entity_type="replenishment_suggestion", entity_id=str(suggestion.id), before_data=before, after_data=suggestion_dict(suggestion), reason=payload.reason, context_replenishment_run_id=run.id)
+    refresh_run_counters(db, run)
     db.commit()
     return suggestion_dict(suggestion, db.get(Product, suggestion.product_id))
 
@@ -510,7 +563,9 @@ def approve_run(run_id: int, payload: ApproveRunRequest, request: Request, db: S
     if not positive and not payload.allow_no_replenishment: fail(request, "NO_REPLENISHMENT_CONFIRMATION_REQUIRED", "本次没有正数确认量，请明确确认无需补库")
     before = run_dict(run)
     run.status, run.approved_by, run.approved_at = "APPROVED", actor.id, datetime.now(UTC)
-    write_audit_log(db, request, user=actor, action="replenishment.run.approve", entity_type="replenishment_run", entity_id=str(run.id), before_data=before, after_data=run_dict(run), reason=payload.reason)
+    refresh_run_counters(db, run)
+    run.status = "APPROVED"
+    write_audit_log(db, request, user=actor, action="replenishment.run.approve", entity_type="replenishment_run", entity_id=str(run.id), before_data=before, after_data=run_dict(run), reason=payload.reason, context_replenishment_run_id=run.id)
     db.commit()
     return run_dict(run)
 
@@ -547,7 +602,8 @@ def convert(run_id: int, payload: ConvertSuggestionsRequest, request: Request, d
             ],
             "run": run_dict(db.get(ReplenishmentRun, run_id)),
         }
-    write_audit_log(db, request, user=actor, action="replenishment.suggestions.convert", entity_type="replenishment_run", entity_id=str(run.id), after_data={"suggestion_ids": payload.suggestion_ids, "demand_ids": [item.id for item in demands]}, reason=payload.reason)
+    refresh_run_counters(db, run)
+    write_audit_log(db, request, user=actor, action="replenishment.suggestions.convert", entity_type="replenishment_run", entity_id=str(run.id), after_data={"suggestion_ids": payload.suggestion_ids, "demand_ids": [item.id for item in demands]}, reason=payload.reason, context_replenishment_run_id=run.id)
     try:
         db.commit()
     except IntegrityError:

@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, JSON, Boolean, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -14,6 +14,10 @@ QTY = Numeric(18, 6)
 
 class ReplenishmentPolicy(Base, TimestampMixin):
     __tablename__ = "replenishment_policies"
+    __table_args__ = (
+        CheckConstraint("fixed_target_qty IS NULL OR fixed_target_qty >= 0", name="ck_replenishment_policy_fixed_target_nonnegative"),
+        CheckConstraint("min_batch_qty IS NULL OR min_batch_qty > 0", name="ck_replenishment_policy_min_batch_positive"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), unique=True, index=True)
@@ -32,6 +36,8 @@ class ReplenishmentRun(Base, TimestampMixin):
     __tablename__ = "replenishment_runs"
     __table_args__ = (
         Index("ix_replenishment_runs_fingerprint_status", "input_fingerprint", "status"),
+        CheckConstraint("default_fixed_target_qty IS NULL OR default_fixed_target_qty >= 0", name="ck_replenishment_run_fixed_target_nonnegative"),
+        CheckConstraint("default_min_batch_qty IS NULL OR default_min_batch_qty > 0", name="ck_replenishment_run_min_batch_positive"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -77,7 +83,10 @@ class ReplenishmentRun(Base, TimestampMixin):
 
 class ReplenishmentSuggestion(Base, TimestampMixin):
     __tablename__ = "replenishment_suggestions"
-    __table_args__ = (UniqueConstraint("run_id", "product_id", name="uq_replenishment_suggestion_run_product"),)
+    __table_args__ = (
+        UniqueConstraint("run_id", "product_id", name="uq_replenishment_suggestion_run_product"),
+        CheckConstraint("confirmed_qty IS NULL OR confirmed_qty >= 0", name="ck_replenishment_suggestion_confirmed_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("replenishment_runs.id", ondelete="CASCADE"), index=True)
@@ -144,7 +153,10 @@ class ReplenishmentIssue(Base, TimestampMixin):
 
 class ReplenishmentOrderInput(Base, TimestampMixin):
     __tablename__ = "replenishment_order_inputs"
-    __table_args__ = (UniqueConstraint("run_id", "product_id", name="uq_replenishment_order_run_product"),)
+    __table_args__ = (
+        UniqueConstraint("run_id", "product_id", name="uq_replenishment_order_run_product"),
+        CheckConstraint("order_qty >= 0", name="ck_replenishment_order_qty_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("replenishment_runs.id", ondelete="CASCADE"), index=True)
@@ -157,6 +169,13 @@ class ReplenishmentOrderInput(Base, TimestampMixin):
 
 class ProductionDemand(Base, TimestampMixin):
     __tablename__ = "production_demands"
+    __table_args__ = (
+        CheckConstraint("confirmed_qty > 0", name="ck_production_demand_confirmed_positive"),
+        CheckConstraint("active_allocated_qty >= 0", name="ck_production_demand_allocated_nonnegative"),
+        CheckConstraint("qualified_completed_qty >= 0", name="ck_production_demand_completed_nonnegative"),
+        CheckConstraint("remaining_to_schedule_qty >= 0", name="ck_production_demand_remaining_schedule_nonnegative"),
+        CheckConstraint("remaining_to_complete_qty >= 0", name="ck_production_demand_remaining_complete_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     demand_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)

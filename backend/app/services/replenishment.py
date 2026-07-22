@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from typing import Any, Iterable
 
-from sqlalchemy import case, distinct, extract, func, select, update
+from sqlalchemy import case, distinct, extract, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -40,6 +42,18 @@ ACTIVE_RUN_STATUSES = {
     "DRAFT", "CALCULATING", "READY_FOR_REVIEW", "PARTIALLY_REVIEWED",
     "APPROVED", "PARTIALLY_CONVERTED", "CONVERTED",
 }
+
+ISSUE_RESOLUTION_POLICIES: dict[str, dict[str, str]] = {
+    "INVENTORY_SNAPSHOT_MISSING": {"mode": "SOURCE_CORRECTION", "error_code": "ISSUE_REQUIRES_SOURCE_CORRECTION"},
+    "ORDER_INPUT_REQUIRED": {"mode": "ORDER_INPUT", "error_code": "ISSUE_REQUIRES_ORDER_INPUT"},
+    "SCHEDULED_ROWS_UNMATCHED": {"mode": "WEEKLY_PLAN_MATCHING", "error_code": "ISSUE_REQUIRES_WEEKLY_PLAN_MATCHING"},
+    "SNAPSHOT_DATE_IN_FUTURE": {"mode": "NOT_OVERRIDABLE", "error_code": "FUTURE_SNAPSHOT_NOT_OVERRIDABLE"},
+    "SCHEDULED_ACTUAL_UNKNOWN": {"mode": "SCHEDULED_OVERRIDE", "error_code": "ISSUE_REQUIRES_SCHEDULED_OVERRIDE"},
+    "SNAPSHOT_DATE_MISMATCH": {"mode": "PLANNER_OVERRIDE", "error_code": "SNAPSHOT_DATE_OVERRIDE_REQUIRED"},
+    "SHIPMENT_WINDOW_INCOMPLETE": {"mode": "ADMIN_OVERRIDE", "error_code": "REPLENISHMENT_OVERRIDE_ADMIN_REQUIRED"},
+}
+_fingerprint_locks_guard = threading.Lock()
+_fingerprint_locks: dict[str, threading.Lock] = {}
 
 
 class ReplenishmentError(Exception):
@@ -135,6 +149,91 @@ def make_demand_no(suggestion_id: int) -> str:
 def canonical_fingerprint(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def issue_resolution_policy(issue_code: str, severity: str) -> dict[str, str]:
+    if issue_code in ISSUE_RESOLUTION_POLICIES:
+        return ISSUE_RESOLUTION_POLICIES[issue_code]
+    if severity in {"WARNING", "INFO"}:
+        return {"mode": "ACKNOWLEDGE", "error_code": ""}
+    return {"mode": "SOURCE_CORRECTION", "error_code": "ISSUE_REQUIRES_SOURCE_CORRECTION"}
+
+
+def weekly_plan_content_snapshot(db: Session, batch_id: int) -> dict[str, Any]:
+    staging_rows = list(db.scalars(
+        select(WeeklyPlanStagingRow)
+        .where(WeeklyPlanStagingRow.import_batch_id == batch_id)
+        .order_by(WeeklyPlanStagingRow.id)
+    ))
+    raw_rows = list(db.scalars(
+        select(ImportedWeeklyPlanRaw)
+        .where(ImportedWeeklyPlanRaw.import_batch_id == batch_id)
+        .order_by(ImportedWeeklyPlanRaw.id)
+    ))
+    return {
+        "import_batch_id": batch_id,
+        "staging_rows": [
+            {
+                "id": item.id,
+                "source_sheet": item.source_sheet,
+                "source_row_number": item.source_row_number,
+                "product_name_raw": item.product_name_raw,
+                "specification_raw": item.specification_raw,
+                "match_status": item.match_status,
+                "matched_product_id": item.matched_product_id,
+                "matched_by": item.matched_by,
+                "match_reason": item.match_reason,
+                "production_batch_no": item.production_batch_no,
+                "process_name": item.process_name,
+                "equipment_name": item.equipment_name,
+                "plan_start_date": item.plan_start_date,
+                "plan_end_date": item.plan_end_date,
+                "planned_quantity": item.weekly_plan_qty,
+                "actual_quantity": item.weekly_actual_qty,
+                "daily_plan": item.daily_plan,
+                "daily_actual": item.daily_actual,
+            }
+            for item in staging_rows
+        ],
+        "raw_rows": [
+            {
+                "id": item.id,
+                "source_sheet": item.source_sheet,
+                "source_row_number": item.source_row_number,
+                "product_id": item.product_id,
+                "production_batch_no": item.production_batch_no,
+                "process_name": item.process_name,
+                "equipment_name": item.equipment_name,
+                "plan_start_date": item.plan_start_date,
+                "plan_end_date": item.plan_end_date,
+                "planned_quantity": item.planned_quantity,
+                "actual_quantity": item.actual_quantity,
+                "daily_plan": item.daily_plan,
+                "daily_actual": item.daily_actual,
+            }
+            for item in raw_rows
+        ],
+    }
+
+
+def weekly_plan_content_fingerprint(db: Session, batch_id: int) -> str:
+    return canonical_fingerprint(weekly_plan_content_snapshot(db, batch_id))
+
+
+@contextmanager
+def input_fingerprint_creation_lock(db: Session, fingerprint: str):
+    if db.get_bind().dialect.name == "postgresql":
+        lock_key = int.from_bytes(bytes.fromhex(fingerprint)[:8], "big", signed=True)
+        db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
+        yield
+        return
+    with _fingerprint_locks_guard:
+        process_lock = _fingerprint_locks.setdefault(fingerprint, threading.Lock())
+    process_lock.acquire()
+    try:
+        yield
+    finally:
+        process_lock.release()
 
 
 def source_fingerprint(
@@ -254,7 +353,14 @@ def add_issue(
     ))
 
 
-def calculate_run(db: Session, run: ReplenishmentRun, *, override: bool = False, override_reason: str | None = None) -> ReplenishmentRun:
+def calculate_run(
+    db: Session,
+    run: ReplenishmentRun,
+    *,
+    override: bool = False,
+    override_reason: str | None = None,
+    override_actor_id: int | None = None,
+) -> ReplenishmentRun:
     if run.status not in {"DRAFT", "FAILED"}:
         raise ReplenishmentError("REPLENISHMENT_STATE_INVALID", "当前补库运行状态不能计算")
     if override and (not override_reason or len(override_reason.strip()) < 2):
@@ -271,6 +377,19 @@ def calculate_run(db: Session, run: ReplenishmentRun, *, override: bool = False,
         batch = source_rows.get(batch_id)
         if batch is None or batch.import_type != import_type or batch.status != "COMPLETED":
             raise ReplenishmentError("REPLENISHMENT_SOURCE_CHANGED", "输入导入批次已失效，不能继续计算", {"batch_id": batch_id, "expected_type": import_type})
+    if run.weekly_plan_batch_id:
+        expected_weekly_fingerprint = run.source_snapshot.get("weekly_plan_content_fingerprint")
+        current_weekly_fingerprint = weekly_plan_content_fingerprint(db, run.weekly_plan_batch_id)
+        if not expected_weekly_fingerprint or current_weekly_fingerprint != expected_weekly_fingerprint:
+            raise ReplenishmentError(
+                "REPLENISHMENT_SOURCE_CHANGED",
+                "周计划业务内容已发生变化，请取消当前运行并重新创建",
+                {
+                    "batch_id": run.weekly_plan_batch_id,
+                    "expected_fingerprint": expected_weekly_fingerprint,
+                    "actual_fingerprint": current_weekly_fingerprint,
+                },
+            )
     claimed = db.execute(
         update(ReplenishmentRun).where(ReplenishmentRun.id == run.id, ReplenishmentRun.status.in_(["DRAFT", "FAILED"]))
         .values(status="CALCULATING")
@@ -312,10 +431,19 @@ def calculate_run(db: Session, run: ReplenishmentRun, *, override: bool = False,
     scheduled, unknown_actuals = aggregate_scheduled(db, run.weekly_plan_batch_id)
 
     issues: list[ReplenishmentIssue] = []
-    blocking_severity = "WARNING" if override else "BLOCKING"
+    def override_details(details: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **details,
+            "manual_override": True,
+            "original_severity": "BLOCKING",
+            "downgraded_severity": "WARNING",
+            "override_actor_id": override_actor_id,
+            "override_reason": override_reason,
+        }
     coverage_end = add_months(months[-1], 1) - timedelta(days=1)
     if min_date is None or max_date is None or min_date > months[0] or max_date < coverage_end:
-        add_issue(issues, run.id, "SHIPMENT_WINDOW_INCOMPLETE", blocking_severity, "销售数据未覆盖前六个完整月份", details={"required_start": str(months[0]), "required_end": str(coverage_end), "actual_start": str(min_date), "actual_end": str(max_date)})
+        details = {"required_start": str(months[0]), "required_end": str(coverage_end), "actual_start": str(min_date), "actual_end": str(max_date)}
+        add_issue(issues, run.id, "SHIPMENT_WINDOW_INCOMPLETE", "WARNING" if override else "BLOCKING", "销售数据未覆盖前六个完整月份", details=override_details(details) if override else details)
     if negative_count:
         add_issue(issues, run.id, "NEGATIVE_SHIPMENT_QUANTITY", "WARNING", "销售数据包含负数量，已按原值参与月度汇总", details={"row_count": negative_count})
     negative_months = [
@@ -333,7 +461,8 @@ def calculate_run(db: Session, run: ReplenishmentRun, *, override: bool = False,
     if any(value > run.calculation_date for value in flattened):
         add_issue(issues, run.id, "SNAPSHOT_DATE_IN_FUTURE", "BLOCKING", "快照日期晚于计算日期", details={key: [str(v) for v in values] for key, values in all_snapshot_dates.items()})
     if any(len(values) != 1 for values in all_snapshot_dates.values()) or len(flattened) != 1:
-        add_issue(issues, run.id, "SNAPSHOT_DATE_MISMATCH", blocking_severity, "库存与在制快照日期不一致", details={key: [str(v) for v in values] for key, values in all_snapshot_dates.items()})
+        details = {key: [str(v) for v in values] for key, values in all_snapshot_dates.items()}
+        add_issue(issues, run.id, "SNAPSHOT_DATE_MISMATCH", "WARNING" if override else "BLOCKING", "库存与在制快照日期不一致", details=override_details(details) if override else details)
     if run.weekly_plan_batch_id is None:
         add_issue(issues, run.id, "SCHEDULED_SOURCE_NOT_SELECTED", "WARNING", "未选择现有周计划，已排未开工数量按 0 计算")
     else:
@@ -415,30 +544,42 @@ def calculate_run(db: Session, run: ReplenishmentRun, *, override: bool = False,
                 add_issue(issues, run.id, "NEGATIVE_WIP_CLAMPED", "WARNING", "在制数量为负，原值保留并按 0 参与计算", product_id=product_id, suggestion_id=suggestion_ids.get(product_id), details={"wip_type": wip_type, "quantity": str(raw_qty)})
     for offset in range(0, len(issues), 1000):
         db.add_all(issues[offset:offset + 1000])
-
-    blocking = sum(1 for item in issues if item.severity == "BLOCKING")
-    warnings = sum(1 for item in issues if item.severity == "WARNING")
+    db.flush()
     run.status = "READY_FOR_REVIEW"
-    run.total_products = len(product_ids)
-    run.suggestion_count = len(rows)
-    run.positive_suggestion_count = sum(1 for row in rows if row["system_suggested_qty"] > ZERO)
-    run.pending_review_count = run.positive_suggestion_count
-    run.reviewed_count = 0
-    run.blocking_issue_count = blocking
-    run.warning_issue_count = warnings
-    run.warning_count = warnings
+    refresh_run_counters(db, run)
     run.calculated_at = datetime.now(UTC)
     if override:
         run.override_reason = override_reason
     return run
 
 
-def refresh_run_status(db: Session, run: ReplenishmentRun) -> None:
-    statuses = list(db.scalars(select(ReplenishmentSuggestion.review_status).where(ReplenishmentSuggestion.run_id == run.id)))
+def refresh_run_counters(db: Session, run: ReplenishmentRun) -> None:
+    db.flush()
+    suggestions = list(db.execute(select(
+        ReplenishmentSuggestion.product_id,
+        ReplenishmentSuggestion.system_suggested_qty,
+        ReplenishmentSuggestion.confirmed_qty,
+        ReplenishmentSuggestion.review_status,
+    ).where(ReplenishmentSuggestion.run_id == run.id)).all())
+    statuses = [row.review_status for row in suggestions]
+    run.total_products = len({row.product_id for row in suggestions})
+    run.suggestion_count = len(suggestions)
+    run.positive_suggestion_count = sum(1 for row in suggestions if as_decimal(row.system_suggested_qty) > ZERO)
     run.reviewed_count = sum(1 for value in statuses if value in {"ACCEPTED", "ADJUSTED", "REJECTED", "CONVERTED"})
     run.pending_review_count = sum(1 for value in statuses if value == "PENDING")
     run.approved_count = sum(1 for value in statuses if value in {"ACCEPTED", "ADJUSTED", "CONVERTED"})
-    demands = db.scalar(select(func.count(ProductionDemand.id)).join(ReplenishmentSuggestion, ProductionDemand.source_suggestion_id == ReplenishmentSuggestion.id).where(ReplenishmentSuggestion.run_id == run.id)) or 0
+    issue_counts = dict(db.execute(
+        select(ReplenishmentIssue.severity, func.count(ReplenishmentIssue.id))
+        .where(ReplenishmentIssue.run_id == run.id, ReplenishmentIssue.status == "OPEN")
+        .group_by(ReplenishmentIssue.severity)
+    ).all())
+    run.blocking_issue_count = issue_counts.get("BLOCKING", 0)
+    run.warning_issue_count = issue_counts.get("WARNING", 0)
+    run.warning_count = run.warning_issue_count
+    demands = db.scalar(select(func.count(ProductionDemand.id)).join(
+        ReplenishmentSuggestion,
+        ProductionDemand.source_suggestion_id == ReplenishmentSuggestion.id,
+    ).where(ReplenishmentSuggestion.run_id == run.id)) or 0
     run.converted_count = demands
     positive_approved = db.scalar(select(func.count(ReplenishmentSuggestion.id)).where(ReplenishmentSuggestion.run_id == run.id, ReplenishmentSuggestion.review_status.in_(["ACCEPTED", "ADJUSTED", "CONVERTED"]), ReplenishmentSuggestion.confirmed_qty > 0)) or 0
     if run.status in {"APPROVED", "PARTIALLY_CONVERTED", "CONVERTED"} and positive_approved and demands == positive_approved:
@@ -449,6 +590,11 @@ def refresh_run_status(db: Session, run: ReplenishmentRun) -> None:
         run.status = "PARTIALLY_REVIEWED"
     elif run.status != "APPROVED":
         run.status = "READY_FOR_REVIEW"
+
+
+def refresh_run_status(db: Session, run: ReplenishmentRun) -> None:
+    """Backward-compatible alias for callers while counters remain centralized."""
+    refresh_run_counters(db, run)
 
 
 def convert_suggestions(db: Session, run: ReplenishmentRun, suggestion_ids: list[int], actor_id: int) -> list[ProductionDemand]:

@@ -11,6 +11,7 @@ from app.core.errors import error_payload
 from app.models import Product, ProductionDemand, ReplenishmentRun, ReplenishmentSuggestion, User
 from app.schemas.replenishment import CancelRequest
 from app.services.audit import write_audit_log
+from app.services.replenishment import refresh_run_counters
 
 
 router = APIRouter(prefix="/api/v1/production-demands", tags=["production-demands"])
@@ -55,6 +56,9 @@ def cancel_demand(demand_id: int, payload: CancelRequest, request: Request, db: 
         raise HTTPException(status_code=409, detail=error_payload(request, "PRODUCTION_DEMAND_ALREADY_ALLOCATED", "需求已有排产占用，不能取消"))
     before = demand_dict(demand)
     demand.status, demand.cancelled_by, demand.cancelled_at, demand.cancel_reason = "CANCELLED", actor.id, datetime.now(UTC), payload.reason
-    write_audit_log(db, request, user=actor, action="production_demand.cancel", entity_type="production_demand", entity_id=str(demand.id), before_data=before, after_data=demand_dict(demand), reason=payload.reason)
+    suggestion = db.get(ReplenishmentSuggestion, demand.source_suggestion_id)
+    run = db.scalar(select(ReplenishmentRun).where(ReplenishmentRun.id == suggestion.run_id).with_for_update())
+    refresh_run_counters(db, run)
+    write_audit_log(db, request, user=actor, action="production_demand.cancel", entity_type="production_demand", entity_id=str(demand.id), before_data=before, after_data=demand_dict(demand), reason=payload.reason, context_replenishment_run_id=run.id)
     db.commit()
     return demand_dict(demand, db.get(Product, demand.product_id))
