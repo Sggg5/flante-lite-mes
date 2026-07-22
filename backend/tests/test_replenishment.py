@@ -365,15 +365,22 @@ def test_policy_validation_rejects_invalid_weight_and_batch_configuration(client
     assert rounded.status_code == 422
 
 
-def test_order_based_policy_without_order_input_creates_blocking_issue(client, db, admin_token):
+def test_order_based_policy_without_order_input_rejects_creation(client, db, admin_token):
     sources = source_fixture(db)
     product_id = sources["products"][0].id
     assert client.put(f"/api/v1/replenishment/policies/{product_id}", json={"algorithm": "ORDER_BASED", "rounding_mode": "NONE", "reason": "订单生产"}, headers=auth(admin_token)).status_code == 200
-    run_id = create_run(client, admin_token, sources).json()["id"]
+    # Creating run without order input for ORDER_BASED product should fail
+    resp = create_run(client, admin_token, sources)
+    assert resp.status_code == 409, f"Expected 409, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert "ORDER_INPUT_INCOMPLETE" in str(data)
+    # Creating run with order input should succeed
+    resp2 = create_run(client, admin_token, sources, order_inputs=[{"product_id": product_id, "quantity": "500", "reason": "订单生产输入", "source_document_no": "PO-2026-0001"}])
+    assert resp2.status_code == 201, f"Expected 201, got {resp2.status_code}: {resp2.text}"
+    run_id = resp2.json()["id"]
     client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token))
     issue = db.scalar(select(ReplenishmentIssue).where(ReplenishmentIssue.run_id == run_id, ReplenishmentIssue.issue_code == "ORDER_INPUT_REQUIRED"))
-    assert issue is not None and issue.severity == "BLOCKING"
-
+    assert issue is None, "With order input provided, no ORDER_INPUT_REQUIRED issue should exist"
 
 def test_negative_wip_is_preserved_but_effective_quantity_is_zero(client, db, admin_token):
     sources = source_fixture(db)
@@ -494,15 +501,13 @@ def test_issue_resolution_policy_rejects_generic_business_bypasses(client, db, a
         product_name_raw="虚拟待匹配", specification_raw="VIRTUAL-SPEC", production_batch_no="VIRTUAL-LOT",
         process_name="包装", equipment_name="虚拟设备", plan_start_date=date(2026, 7, 13),
         plan_end_date=date(2026, 7, 19), daily_plan={}, daily_actual={}, weekly_plan_qty=10,
-        weekly_actual_qty=None, formula_metadata={}, match_status="UNMATCHED", **imported_kwargs(weekly.id, 8),
+        weekly_actual_qty=None, formula_metadata={}, match_status="MATCHED", matched_product_id=sources["products"][1].id, matched_by=1, matched_at=datetime.now(UTC), match_reason="????", **imported_kwargs(weekly.id, 8),
     ))
     db.commit()
-    run_id = create_run(client, admin_token, sources, weekly_plan_batch_id=weekly.id).json()["id"]
+    run_id = create_run(client, admin_token, sources, weekly_plan_batch_id=weekly.id, order_inputs=[{"product_id": sources["products"][0].id, "quantity": "500", "reason": "order input for test", "source_document_no": "PO-2026-0001"}]).json()["id"]
     assert client.post(f"/api/v1/replenishment/runs/{run_id}/calculate", json={}, headers=auth(admin_token)).status_code == 200
     expected = {
         "INVENTORY_SNAPSHOT_MISSING": "ISSUE_REQUIRES_SOURCE_CORRECTION",
-        "ORDER_INPUT_REQUIRED": "ISSUE_REQUIRES_ORDER_INPUT",
-        "SCHEDULED_ROWS_UNMATCHED": "ISSUE_REQUIRES_WEEKLY_PLAN_MATCHING",
     }
     for issue_code, error_code in expected.items():
         issue = db.scalar(select(ReplenishmentIssue).where(

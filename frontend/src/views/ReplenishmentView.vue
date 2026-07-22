@@ -65,6 +65,11 @@ async function loadSource(type: string) {
 async function startWizard() {
   wizardStep.value = 0
   wizardVisible.value = true
+  form.calculation_date = getLocalDateString()
+  form.weekly_plan_batch_id = undefined
+  orderInputs.value = []
+  runPage.value = 1; suggestionPage.value = 1; issuePage.value = 1
+  selectedSuggestions.value = []
   await Promise.all(['SHIPMENT', 'INVENTORY', 'PIPE_WIP', 'FITTING_WIP', 'REGULAR_PRODUCT', 'WEEKLY_PLAN'].map(loadSource))
 }
 
@@ -114,9 +119,8 @@ async function handleIssue(issue: ReplenishmentIssue, action: 'RESOLVE' | 'IGNOR
 }
 
 async function openScheduledOverride(issue: ReplenishmentIssue) {
-  const suggestion = suggestions.value.find(item => item.product_id === issue.product_id)
-  if (!suggestion) return ElMessage.error('未找到该问题对应的补库建议')
-  scheduledOverrideSuggestion.value = await getSuggestion(suggestion.id)
+  if (!issue.suggestion_id) return ElMessage.error('该问题没有关联补库建议，无法填写已排覆盖')
+    scheduledOverrideSuggestion.value = await getSuggestion(issue.suggestion_id)
   scheduledOverrideForm.qty = scheduledOverrideSuggestion.value.scheduled_override_qty ?? '0'
   scheduledOverrideForm.reason = ''
   scheduledOverrideVisible.value = true
@@ -224,10 +228,7 @@ function handleSuggestionSizeChange(size: number) {
         <el-table-column prop="run_no" label="运行编号" min-width="190" /><el-table-column prop="calculation_date" label="计算日期" width="120" /><el-table-column label="快照日期" width="120"><template #default="{ row }">{{ row.source_date_summary?.inventory ?? '-' }}</template></el-table-column><el-table-column prop="default_algorithm" label="默认算法" width="160" /><el-table-column prop="status" label="状态" width="170" /><el-table-column prop="total_products" label="产品" width="80" /><el-table-column prop="positive_suggestion_count" label="正数建议" width="90" /><el-table-column prop="pending_review_count" label="待审核" width="90" /><el-table-column prop="converted_count" label="已转换" width="90" /><el-table-column prop="warning_count" label="警告" width="75" /><el-table-column prop="blocking_issue_count" label="阻断" width="75" /><el-table-column prop="created_by" label="创建人" width="85" /><el-table-column prop="created_at" label="创建时间" width="170" />
       </el-table>
       <el-pagination v-if="runTotal > 0" v-model:current-page="runPage" :page-size="runPageSize" :total="runTotal" layout="total, prev, pager, next" size="small" @current-change="handleRunPageChange" />
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">
-        <span style="color:#909399;font-size:13px">??? {{ selectedSuggestions.length }} ?</span>
-        <el-pagination v-if="suggestionTotal > 0" v-model:current-page="suggestionPage" :page-size="suggestionPageSize" :page-sizes="[50,100,200]" :total="suggestionTotal" layout="total, sizes, prev, pager, next, jumper" @size-change="handleSuggestionSizeChange" @current-change="handleSuggestionPageChange" />
-      </div>
+      
     </el-card>
 
     <el-card v-if="selectedRun" shadow="never" class="suggestions-card">
@@ -237,7 +238,7 @@ function handleSuggestionSizeChange(size: number) {
       <el-form inline><el-input v-model="filters.keyword" placeholder="产品编码/名称/规格" clearable style="width:230px" /><el-select v-model="filters.review_status" clearable placeholder="审核状态" style="width:150px"><el-option v-for="value in ['PENDING','ACCEPTED','ADJUSTED','REJECTED','NOT_REQUIRED','CONVERTED']" :key="value" :value="value" /></el-select><el-switch v-model="positiveOnly" active-text="只看正数建议" inactive-text="查看全部"/><el-button @click="openRun(selectedRun)">查询</el-button></el-form>
       <el-table :data="suggestions" row-key="id" @row-click="openSuggestionDetail" @selection-change="selectionChanged"><el-table-column type="selection" width="46" /><el-table-column prop="product_code" label="产品编码" fixed width="150" /><el-table-column prop="product_name" label="名称" fixed width="150" /><el-table-column prop="specification" label="规格" width="140" /><el-table-column label="六个月销量" min-width="260"><template #default="{ row }"><span class="month-values">{{ Object.values(row.monthly_shipments).join(' / ') }}</span></template></el-table-column><el-table-column prop="target_stock_qty" label="目标库存" width="110" /><el-table-column prop="on_hand_qty" label="现存" width="90" /><el-table-column prop="expected_inbound_qty" label="预计入库" width="95" /><el-table-column prop="expected_outbound_qty" label="预计出库" width="95" /><el-table-column prop="available_qty" label="可用库存" width="110" /><el-table-column prop="pipe_wip_effective_qty" label="水管在制" width="100" /><el-table-column prop="fitting_wip_effective_qty" label="管件在制" width="100" /><el-table-column prop="scheduled_not_started_qty" label="已排未开" width="100" /><el-table-column prop="system_suggested_qty" label="系统建议" width="110" /><el-table-column prop="confirmed_qty" label="确认量" width="100" /><el-table-column prop="review_status" label="审核状态" width="110" /><el-table-column v-if="canReview" label="操作" fixed="right" width="90"><template #default="{ row }"><el-button link type="primary" @click.stop="approveOne(row)">审核</el-button></template></el-table-column></el-table>
       <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">
-        <span style="color:#909399;font-size:13px">??? {{ selectedSuggestions.length }} ?</span>
+        <span style="color:#909399;font-size:13px">当前页已选择 {{ selectedSuggestions.length }} 条</span>
         <el-pagination v-if="suggestionTotal > 0" v-model:current-page="suggestionPage" :page-size="suggestionPageSize" :page-sizes="[50,100,200]" :total="suggestionTotal" layout="total, sizes, prev, pager, next, jumper" @size-change="handleSuggestionSizeChange" @current-change="handleSuggestionPageChange" />
       </div>
     </el-card>
@@ -283,9 +284,9 @@ function handleSuggestionSizeChange(size: number) {
         <el-select v-if="wizardStep === 3" v-model="form.pipe_wip_batch_id" filterable placeholder="请选择水管在制批次" style="width:100%"><el-option v-for="item in sourceOptions.PIPE_WIP" :key="item.id" :label="`${item.batch_no} · ${item.source_date ?? '无数据日期'}`" :value="item.id" /></el-select>
         <el-select v-if="wizardStep === 4" v-model="form.fitting_wip_batch_id" filterable placeholder="请选择管件在制批次" style="width:100%"><el-option v-for="item in sourceOptions.FITTING_WIP" :key="item.id" :label="`${item.batch_no} · ${item.source_date ?? '无数据日期'}`" :value="item.id" /></el-select>
         <el-select v-if="wizardStep === 5" v-model="form.regular_product_batch_id" filterable placeholder="请选择常规产品批次" style="width:100%"><el-option v-for="item in sourceOptions.REGULAR_PRODUCT" :key="item.id" :label="`${item.batch_no} · ${item.source_date ?? '无数据日期'}`" :value="item.id" /></el-select>
-        <el-select v-if="wizardStep === 6" v-model="form.weekly_plan_batch_id" clearable filterable placeholder="可选：请选择已匹配周计划批次" style="width:100%"><el-option v-for="item in sourceOptions.WEEKLY_PLAN" :key="item.id" :label="`${item.batch_no} · ${item.source_date ?? '无数据日期'}`" :value="item.id" /></el-select>
+        <el-select v-if="wizardStep === 6" v-model="form.weekly_plan_batch_id" clearable filterable placeholder="可选：请选择已匹配周计划批次" style="width:100%"><el-option v-for="item in sourceOptions.WEEKLY_PLAN" :key="item.id" :value="item.id" :disabled="item.matching_complete === false"><span style="display:flex;justify-content:space-between;width:100%"><span>{{ item.batch_no }} · {{ item.source_date ?? '无数据日期' }}</span><span :style="{color:item.matching_complete?'#67c23a':'#e6a23c'}">{{ item.matching_complete ? '✓ 匹配完成' : '✗ 待匹配('+(item.incomplete_rows??0)+')' }}</span></span></el-option></el-select>
         <el-select v-if="wizardStep === 7" v-model="defaultAlgorithm" style="width:100%" placeholder="默认算法"><el-option v-for="value in ['SIX_MONTH_MAX','SIX_MONTH_AVG','THREE_MONTH_AVG','SIX_MONTH_WEIGHTED','FIXED_TARGET','ORDER_BASED']" :key="value" :value="value" /></el-select>
-        <div v-if="wizardStep === 8" class="order-inputs"><el-input v-if="defaultAlgorithm === 'SIX_MONTH_WEIGHTED'" v-model="defaultWeights" placeholder="六个权重，逗号分隔且合计为1"/><el-input v-if="defaultAlgorithm === 'FIXED_TARGET'" v-model="defaultFixedTargetQty" placeholder="默认固定目标库存"/><el-select v-model="roundingMode" style="width:100%"><el-option value="NONE"/><el-option value="CEIL_TO_INTEGER"/><el-option value="CEIL_TO_MIN_BATCH"/></el-select><el-input v-if="roundingMode === 'CEIL_TO_MIN_BATCH'" v-model="defaultMinBatchQty" placeholder="默认最小批量"/><el-button v-if="defaultAlgorithm === 'ORDER_BASED'" @click="addOrderInput">添加订单产品</el-button><div v-for="(item,index) in orderInputs" :key="index" class="order-row"><el-select v-model="item.product_id" filterable remote :remote-method="searchProducts" placeholder="搜索产品编码/名称" style="width:330px"><el-option v-for="product in productOptions" :key="product.id" :value="product.id" :label="`${product.product_code} · ${product.product_name ?? ''}`"/></el-select><el-input v-model="item.quantity" placeholder="订单数量"/><el-input v-model="item.reason" placeholder="输入原因"/><el-button type="danger" link @click="orderInputs.splice(index,1)">删除</el-button></div></div>
+        <div v-if="wizardStep === 8" class="order-inputs"><el-input v-if="defaultAlgorithm === 'SIX_MONTH_WEIGHTED'" v-model="defaultWeights" placeholder="六个权重，逗号分隔且合计为1"/><el-input v-if="defaultAlgorithm === 'FIXED_TARGET'" v-model="defaultFixedTargetQty" placeholder="默认固定目标库存"/><el-select v-model="roundingMode" style="width:100%"><el-option value="NONE"/><el-option value="CEIL_TO_INTEGER"/><el-option value="CEIL_TO_MIN_BATCH"/></el-select><el-input v-if="roundingMode === 'CEIL_TO_MIN_BATCH'" v-model="defaultMinBatchQty" placeholder="默认最小批量"/><el-button @click="addOrderInput">添加订单产品</el-button><p v-if="orderInputs.length === 0" style="color:#909399;font-size:12px;margin:0">订单型产品输入（仅 ORDER_BASED 产品需要）</p><div v-for="(item,index) in orderInputs" :key="index" class="order-row"><el-select v-model="item.product_id" filterable remote :remote-method="searchProducts" placeholder="搜索产品编码/名称" style="width:330px"><el-option v-for="product in productOptions" :key="product.id" :value="product.id" :label="`${product.product_code} · ${product.product_name ?? ''}`"/></el-select><el-input v-model="item.quantity" placeholder="订单数量"/><el-input v-model="item.reason" placeholder="输入原因"/><el-button type="danger" link @click="orderInputs.splice(index,1)">删除</el-button></div></div>
         <el-alert v-if="wizardStep === 9" title="系统将检查三类快照日期一致、不得晚于计算日，并检查销售是否完整覆盖前六个自然月。" type="warning" show-icon :closable="false" />
         <el-alert v-if="wizardStep === 10" title="未匹配周计划、未知实际量、缺失库存和销售窗口不足会形成阻断问题；计算后必须逐项处理。" type="warning" show-icon :closable="false" />
         <el-alert v-if="wizardStep === 11" title="计算可能需要数分钟。处理中请勿关闭页面或重复提交。" type="success" show-icon :closable="false" />

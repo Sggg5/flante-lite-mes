@@ -199,17 +199,31 @@ def source_batches(import_type: str | None = None, db: Session = Depends(get_db)
         if import_type not in allowed: return {"items": []}
         query = query.where(ImportBatch.import_type == import_type)
     items = db.scalars(query.order_by(ImportBatch.confirmed_at.desc(), ImportBatch.id.desc()).limit(500)).all()
+    # Aggregate weekly plan stats in a single GROUP BY query
+    wp_batch_ids = {item.id for item in items if item.import_type == "WEEKLY_PLAN"}
+    wp_stats: dict[int, dict[str, int]] = {}
+    if wp_batch_ids:
+        from sqlalchemy import case
+        rows = db.execute(
+            select(
+                WeeklyPlanStagingRow.import_batch_id,
+                func.count(WeeklyPlanStagingRow.id),
+                func.sum(case((WeeklyPlanStagingRow.match_status == "MATCHED", 1), else_=0)),
+                func.sum(case((WeeklyPlanStagingRow.match_status == "IGNORED", 1), else_=0)),
+            ).where(WeeklyPlanStagingRow.import_batch_id.in_(wp_batch_ids))
+            .group_by(WeeklyPlanStagingRow.import_batch_id)
+        ).all()
+        for bid, total, matched, ignored in rows:
+            wp_stats[bid] = {"total": total, "matched": matched, "ignored": ignored}
     result = []
     for item in items:
         entry = {"id": item.id, "batch_no": item.batch_no, "import_type": item.import_type, "source_date": item.source_date, "imported_rows": item.imported_rows, "confirmed_at": item.confirmed_at}
-        if item.import_type == "WEEKLY_PLAN":
-            total = db.scalar(func.count(WeeklyPlanStagingRow.id).filter(WeeklyPlanStagingRow.import_batch_id == item.id)) or 0
-            matched = db.scalar(func.count(WeeklyPlanStagingRow.id).filter(WeeklyPlanStagingRow.import_batch_id == item.id, WeeklyPlanStagingRow.match_status == "MATCHED")) or 0
-            ignored = db.scalar(func.count(WeeklyPlanStagingRow.id).filter(WeeklyPlanStagingRow.import_batch_id == item.id, WeeklyPlanStagingRow.match_status == "IGNORED")) or 0
-            incomplete = total - matched - ignored
-            entry["total_staging_rows"] = total
-            entry["matched_rows"] = matched
-            entry["ignored_rows"] = ignored
+        if item.import_type == "WEEKLY_PLAN" and item.id in wp_stats:
+            stats = wp_stats[item.id]
+            incomplete = stats["total"] - stats["matched"] - stats["ignored"]
+            entry["total_staging_rows"] = stats["total"]
+            entry["matched_rows"] = stats["matched"]
+            entry["ignored_rows"] = stats["ignored"]
             entry["incomplete_rows"] = incomplete
             entry["matching_complete"] = incomplete == 0
         result.append(entry)
@@ -279,6 +293,22 @@ def create_run(
         snapshot["weekly_plan_content_fingerprint"] = weekly_plan_content_fingerprint(
             db, payload.weekly_plan_batch_id
         )
+        staging_rows = list(db.scalars(select(WeeklyPlanStagingRow).where(WeeklyPlanStagingRow.import_batch_id == payload.weekly_plan_batch_id)))
+        total_s = len(staging_rows)
+        matched_s = sum(1 for r in staging_rows if r.match_status == "MATCHED")
+        ignored_s = sum(1 for r in staging_rows if r.match_status == "IGNORED")
+        unmatched_s = sum(1 for r in staging_rows if r.match_status == "UNMATCHED")
+        suggested_s = sum(1 for r in staging_rows if r.match_status == "SUGGESTED")
+        conflict_s = sum(1 for r in staging_rows if r.match_status == "CONFLICT")
+        incomplete_s = total_s - matched_s - ignored_s
+        incomplete_ids = [r.id for r in staging_rows if r.match_status not in {"MATCHED", "IGNORED"}][:20]
+        if incomplete_s > 0:
+            fail(request, "WEEKLY_PLAN_MATCHING_INCOMPLETE",
+                 "????????????????Excel????????",
+                 {"total_staging_rows": total_s, "matched_rows": matched_s, "ignored_rows": ignored_s,
+                  "unmatched_count": unmatched_s, "suggested_count": suggested_s,
+                  "conflict_count": conflict_s, "incomplete_count": incomplete_s,
+                  "sample_staging_ids": incomplete_ids})
     regular_product_ids = select(RegularProductionProduct.product_id).where(RegularProductionProduct.import_batch_id == regular_batch_id)
     configured_policies = db.scalars(select(ReplenishmentPolicy).where(ReplenishmentPolicy.product_id.in_(regular_product_ids), ReplenishmentPolicy.is_active.is_(True))).all()
     snapshot["policies"] = {
@@ -319,13 +349,44 @@ def create_run(
         db.add(run)
         db.flush()
         seen: set[int] = set()
+        # Build set of all regular production product IDs for this run
+        rp_all = set(db.scalars(select(RegularProductionProduct.product_id).where(
+            RegularProductionProduct.import_batch_id == regular_batch_id
+        )).all())
         for item in payload.order_inputs:
             if item.product_id in seen:
                 fail(request, "ORDER_INPUT_DUPLICATE", "同一产品不能重复填写订单输入", http_status=422)
             seen.add(item.product_id)
+            if item.product_id not in rp_all:
+                fail(request, "ORDER_INPUT_PRODUCT_NOT_IN_RUN", f"产品 {item.product_id} 不在本次常规排产产品清单中")
             if db.get(Product, item.product_id) is None:
                 fail(request, "PRODUCT_NOT_FOUND", "订单输入包含不存在的产品", http_status=404)
-            db.add(ReplenishmentOrderInput(run_id=run.id, product_id=item.product_id, order_qty=item.quantity, source_document_no=item.source_document_no, note=item.reason, created_by=actor.id))
+            policy_rec = db.scalar(select(ReplenishmentPolicy).where(
+                ReplenishmentPolicy.product_id == item.product_id,
+                ReplenishmentPolicy.is_active.is_(True),
+            ))
+            effective_algo = policy_rec.algorithm if policy_rec else payload.default_algorithm
+            if effective_algo != "ORDER_BASED":
+                fail(request, "ORDER_INPUT_NOT_REQUIRED", f"产品 {item.product_id} 策略为 {effective_algo}，不需要订单输入")
+            db.add(ReplenishmentOrderInput(run_id=run.id, product_id=item.product_id, order_qty=item.quantity, source_document_no=item.source_document_no, created_by=actor.id))
+        # Check for ORDER_BASED products missing order inputs
+        order_product_ids = {item.product_id for item in payload.order_inputs}
+        rp_policies = db.execute(
+            select(RegularProductionProduct.product_id, ReplenishmentPolicy.algorithm).outerjoin(
+                ReplenishmentPolicy,
+                and_(ReplenishmentPolicy.product_id == RegularProductionProduct.product_id,
+                     ReplenishmentPolicy.is_active.is_(True)),
+            ).where(RegularProductionProduct.import_batch_id == regular_batch_id)
+        ).all()
+        missing_order_ids = []
+        for rp_id, algo in rp_policies:
+            effective = algo if algo else payload.default_algorithm
+            if effective == "ORDER_BASED" and rp_id not in order_product_ids:
+                missing_order_ids.append(rp_id)
+        if missing_order_ids:
+            fail(request, "ORDER_INPUT_INCOMPLETE",
+                 "以下 ORDER_BASED 产品缺少订单输入",
+                 {"missing_product_ids": missing_order_ids[:20]})
         write_audit_log(db, request, user=actor, action="replenishment.run.create", entity_type="replenishment_run", entity_id=str(run.id), after_data=run_dict(run), reason=payload.force_reason, context_replenishment_run_id=run.id)
         db.commit()
     return run_dict(run)
@@ -435,6 +496,15 @@ def resolve_issue(run_id: int, issue_id: int, payload: ResolveIssueRequest, requ
         fail(request, policy["error_code"], "该问题必须通过指定业务流程处理，不能通用解决或忽略")
     if mode == "ADMIN_OVERRIDE" and "ADMIN" not in get_role_codes(actor):
         fail(request, "REPLENISHMENT_OVERRIDE_ADMIN_REQUIRED", "只有管理员可以放行销售窗口不完整问题", http_status=403)
+    # Idempotent: already-resolved issues
+    if issue.status != "OPEN":
+        same_action = (payload.action == "RESOLVE" and issue.status == "RESOLVED") or (payload.action == "IGNORE" and issue.status == "IGNORED")
+        if same_action and issue.resolution_note == payload.reason:
+            return issue_dict(issue)
+        fail(request, "REPLENISHMENT_ISSUE_ALREADY_HANDLED",
+             "该问题已处理，不能重复处理",
+             {"current_status": issue.status, "resolved_by": issue.resolved_by,
+              "resolution_note": issue.resolution_note})
     before = issue_dict(issue)
     issue.status = "RESOLVED" if mode == "ACKNOWLEDGE" else "IGNORED"
     issue.resolved_by, issue.resolved_at, issue.resolution_note = actor.id, datetime.now(UTC), payload.reason
@@ -547,6 +617,20 @@ def set_scheduled_override(suggestion_id: int, payload: ScheduledOverrideRequest
     if suggestion is None: fail(request, "SUGGESTION_NOT_FOUND", "补库建议不存在", http_status=404)
     run = get_run(db, request, suggestion.run_id, lock=True)
     if run.status not in {"READY_FOR_REVIEW", "PARTIALLY_REVIEWED"}: fail(request, "REPLENISHMENT_STATE_INVALID", "当前运行状态不能修改已排数量")
+    # Restrict: must have weekly_plan_batch_id
+    if not run.weekly_plan_batch_id:
+        fail(request, "SCHEDULED_OVERRIDE_NOT_ALLOWED", "该运行未选择周计划批次，不允许已排覆盖")
+    # Restrict: suggestion must have SCHEDULED_ACTUAL_UNKNOWN issue
+    unknown_issue = db.scalar(select(ReplenishmentIssue).where(
+        ReplenishmentIssue.run_id == run.id,
+        ReplenishmentIssue.suggestion_id == suggestion.id,
+        ReplenishmentIssue.issue_code == "SCHEDULED_ACTUAL_UNKNOWN",
+    ).with_for_update())
+    if unknown_issue is None:
+        fail(request, "SCHEDULED_OVERRIDE_NOT_ALLOWED", "该建议没有 SCHEDULED_ACTUAL_UNKNOWN 问题，不允许已排覆盖")
+    if unknown_issue.status != "OPEN":
+        fail(request, "SCHEDULED_OVERRIDE_NOT_ALLOWED", "SCHEDULED_ACTUAL_UNKNOWN 问题已处理，不允许再次覆盖",
+             {"issue_status": unknown_issue.status})
     before = suggestion_dict(suggestion)
     suggestion.scheduled_override_qty = payload.scheduled_override_qty
     suggestion.scheduled_not_started_qty = suggestion.scheduled_known_qty + payload.scheduled_override_qty
@@ -557,8 +641,8 @@ def set_scheduled_override(suggestion_id: int, payload: ScheduledOverrideRequest
     suggestion.confirmed_qty = Decimal("0") if suggestion.system_suggested_qty == 0 else None
     suggestion.review_status = "NOT_REQUIRED" if suggestion.system_suggested_qty == 0 else "PENDING"
     issue = db.scalar(select(ReplenishmentIssue).where(ReplenishmentIssue.suggestion_id == suggestion.id, ReplenishmentIssue.issue_code == "SCHEDULED_ACTUAL_UNKNOWN", ReplenishmentIssue.status == "OPEN").with_for_update())
-    if issue:
-        issue.status, issue.resolved_by, issue.resolved_at, issue.resolution_note = "RESOLVED", actor.id, datetime.now(UTC), payload.reason
+    if unknown_issue:
+        unknown_issue.status, issue.resolved_by, issue.resolved_at, issue.resolution_note = "RESOLVED", actor.id, datetime.now(UTC), payload.reason
     write_audit_log(db, request, user=actor, action="replenishment.scheduled_override", entity_type="replenishment_suggestion", entity_id=str(suggestion.id), before_data=before, after_data=suggestion_dict(suggestion), reason=payload.reason, context_replenishment_run_id=run.id)
     refresh_run_counters(db, run)
     db.commit()
