@@ -45,6 +45,7 @@ class OrderInputRequest(BaseModel):
     quantity: Decimal = Field(ge=0)
     reason: str = Field(min_length=2, max_length=500)
     source_document_no: str | None = Field(default=None, max_length=100)
+    note: str | None = Field(default=None, max_length=500)
 
 
 class CreateRunRequest(BaseModel):

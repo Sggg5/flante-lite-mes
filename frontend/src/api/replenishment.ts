@@ -34,8 +34,15 @@ export interface ProductionDemand {
   required_date: string | null; status: string; created_at: string
 }
 
+export interface SourceBatch { id: number; batch_no: string; import_type: string; source_date: string | null; imported_rows: number; confirmed_at: string; total_staging_rows?: number; matched_rows?: number; ignored_rows?: number; incomplete_rows?: number; matching_complete?: boolean }
 export interface ReplenishmentIssue { id: number; run_id: number | null; suggestion_id: number | null; issue_code: string; severity: string; message: string; status: string; product_id: number | null; details: Record<string, unknown> | null }
 export interface ProductOption { id: number; product_code: string; product_name: string | null; specification: string | null }
+
+export async function listReplenishmentSourceBatches(importType?: string) {
+  const params: Record<string, unknown> = {}
+  if (importType) params.import_type = importType
+  return (await http.get<{ items: SourceBatch[] }>('/v1/replenishment/source-batches', { params })).data
+}
 
 export function describeReplenishmentError(error: unknown): string {
   if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {

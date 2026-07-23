@@ -218,8 +218,8 @@ def source_batches(import_type: str | None = None, db: Session = Depends(get_db)
     result = []
     for item in items:
         entry = {"id": item.id, "batch_no": item.batch_no, "import_type": item.import_type, "source_date": item.source_date, "imported_rows": item.imported_rows, "confirmed_at": item.confirmed_at}
-        if item.import_type == "WEEKLY_PLAN" and item.id in wp_stats:
-            stats = wp_stats[item.id]
+        if item.import_type == "WEEKLY_PLAN":
+            stats = wp_stats.get(item.id, {"total": 0, "matched": 0, "ignored": 0})
             incomplete = stats["total"] - stats["matched"] - stats["ignored"]
             entry["total_staging_rows"] = stats["total"]
             entry["matched_rows"] = stats["matched"]
@@ -277,7 +277,7 @@ def create_run(
         if batch.status != "COMPLETED":
             fail(request, "REPLENISHMENT_SOURCE_NOT_COMPLETED", f"{key} 来源批次尚未完成")
         batches[key] = batch
-    order_snapshot = [{"product_id": item.product_id, "order_qty": str(item.quantity), "source_document_no": item.source_document_no} for item in payload.order_inputs]
+    order_snapshot = [{"product_id": item.product_id, "order_qty": str(item.quantity), "source_document_no": item.source_document_no, "note": item.note} for item in payload.order_inputs]
     fingerprint, snapshot = source_fingerprint(payload.calculation_date, batches, order_snapshot)
     source_dates = {key: batch.source_date.isoformat() if batch and batch.source_date else None for key, batch in batches.items()}
     calculation_config = {
@@ -304,7 +304,7 @@ def create_run(
         incomplete_ids = [r.id for r in staging_rows if r.match_status not in {"MATCHED", "IGNORED"}][:20]
         if incomplete_s > 0:
             fail(request, "WEEKLY_PLAN_MATCHING_INCOMPLETE",
-                 "????????????????Excel????????",
+                 "周计划仍有未完成产品匹配的记录，请先到Excel导入中心完成匹配",
                  {"total_staging_rows": total_s, "matched_rows": matched_s, "ignored_rows": ignored_s,
                   "unmatched_count": unmatched_s, "suggested_count": suggested_s,
                   "conflict_count": conflict_s, "incomplete_count": incomplete_s,
@@ -368,7 +368,7 @@ def create_run(
             effective_algo = policy_rec.algorithm if policy_rec else payload.default_algorithm
             if effective_algo != "ORDER_BASED":
                 fail(request, "ORDER_INPUT_NOT_REQUIRED", f"产品 {item.product_id} 策略为 {effective_algo}，不需要订单输入")
-            db.add(ReplenishmentOrderInput(run_id=run.id, product_id=item.product_id, order_qty=item.quantity, source_document_no=item.source_document_no, created_by=actor.id))
+            db.add(ReplenishmentOrderInput(run_id=run.id, product_id=item.product_id, order_qty=item.quantity, source_document_no=item.source_document_no, created_by=actor.id, note=item.reason))
         # Check for ORDER_BASED products missing order inputs
         order_product_ids = {item.product_id for item in payload.order_inputs}
         rp_policies = db.execute(
@@ -499,7 +499,7 @@ def resolve_issue(run_id: int, issue_id: int, payload: ResolveIssueRequest, requ
     # Idempotent: already-resolved issues
     if issue.status != "OPEN":
         same_action = (payload.action == "RESOLVE" and issue.status == "RESOLVED") or (payload.action == "IGNORE" and issue.status == "IGNORED")
-        if same_action and issue.resolution_note == payload.reason:
+        if same_action and issue.resolution_note == payload.reason and actor.id == issue.resolved_by:
             return issue_dict(issue)
         fail(request, "REPLENISHMENT_ISSUE_ALREADY_HANDLED",
              "该问题已处理，不能重复处理",
@@ -628,9 +628,13 @@ def set_scheduled_override(suggestion_id: int, payload: ScheduledOverrideRequest
     ).with_for_update())
     if unknown_issue is None:
         fail(request, "SCHEDULED_OVERRIDE_NOT_ALLOWED", "该建议没有 SCHEDULED_ACTUAL_UNKNOWN 问题，不允许已排覆盖")
+    # Allow re-override if the issue was originally resolved via SCHEDULED_OVERRIDE
     if unknown_issue.status != "OPEN":
-        fail(request, "SCHEDULED_OVERRIDE_NOT_ALLOWED", "SCHEDULED_ACTUAL_UNKNOWN 问题已处理，不允许再次覆盖",
-             {"issue_status": unknown_issue.status})
+        orig_policy = (unknown_issue.details or {}).get("resolution_policy", "")
+        if orig_policy != "SCHEDULED_OVERRIDE":
+            fail(request, "SCHEDULED_OVERRIDE_NOT_ALLOWED", "SCHEDULED_ACTUAL_UNKNOWN 问题已通过其他方式处理，不允许覆盖",
+                 {"issue_status": unknown_issue.status, "resolution_policy": orig_policy})
+
     before = suggestion_dict(suggestion)
     suggestion.scheduled_override_qty = payload.scheduled_override_qty
     suggestion.scheduled_not_started_qty = suggestion.scheduled_known_qty + payload.scheduled_override_qty
@@ -640,9 +644,27 @@ def set_scheduled_override(suggestion_id: int, payload: ScheduledOverrideRequest
     suggestion.system_suggested_qty = max(raw, Decimal("0"))
     suggestion.confirmed_qty = Decimal("0") if suggestion.system_suggested_qty == 0 else None
     suggestion.review_status = "NOT_REQUIRED" if suggestion.system_suggested_qty == 0 else "PENDING"
-    issue = db.scalar(select(ReplenishmentIssue).where(ReplenishmentIssue.suggestion_id == suggestion.id, ReplenishmentIssue.issue_code == "SCHEDULED_ACTUAL_UNKNOWN", ReplenishmentIssue.status == "OPEN").with_for_update())
-    if unknown_issue:
-        unknown_issue.status, issue.resolved_by, issue.resolved_at, issue.resolution_note = "RESOLVED", actor.id, datetime.now(UTC), payload.reason
+    # Update the SCHEDULED_ACTUAL_UNKNOWN issue with override details and history
+    override_history = (unknown_issue.details or {}).get("override_history", [])
+    override_history.append({
+        "before_qty": str(before.get("scheduled_override_qty", "0")),
+        "after_qty": str(payload.scheduled_override_qty),
+        "actor_id": actor.id,
+        "reason": payload.reason,
+        "occurred_at": datetime.now(UTC).isoformat(),
+    })
+    unknown_issue.status = "RESOLVED"
+    unknown_issue.resolved_by = actor.id
+    unknown_issue.resolved_at = datetime.now(UTC)
+    unknown_issue.resolution_note = payload.reason
+    unknown_issue.details = {
+        **(unknown_issue.details or {}),
+        "resolution_policy": "SCHEDULED_OVERRIDE",
+        "latest_override_qty": str(payload.scheduled_override_qty),
+        "latest_override_reason": payload.reason,
+        "override_count": len(override_history),
+        "override_history": override_history,
+    }
     write_audit_log(db, request, user=actor, action="replenishment.scheduled_override", entity_type="replenishment_suggestion", entity_id=str(suggestion.id), before_data=before, after_data=suggestion_dict(suggestion), reason=payload.reason, context_replenishment_run_id=run.id)
     refresh_run_counters(db, run)
     db.commit()
