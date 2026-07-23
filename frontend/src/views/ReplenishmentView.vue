@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
-import { approveRun, bulkReviewSuggestions, calculateRun, convertSuggestions, createRun, describeReplenishmentError, getSuggestion, listReplenishmentSourceBatches, listRunIssues, listRuns, listSuggestions, resolveRunIssue, searchReplenishmentProducts, reviewSuggestion, updateScheduledOverride, type ProductOption, type ReplenishmentIssue, type ReplenishmentRun, type ReplenishmentSuggestion, type SourceBatch } from '../api/replenishment'
+import { approveRun, bulkReviewSuggestions, calculateRun, convertSuggestions, createRun, describeReplenishmentError, getReplenishmentRun, getSuggestion, listReplenishmentSourceBatches, listRunIssues, listRuns, listSuggestions, resolveRunIssue, searchReplenishmentProducts, reviewSuggestion, updateScheduledOverride, type ProductOption, type ReplenishmentIssue, type ReplenishmentRun, type ReplenishmentSuggestion, type SourceBatch } from '../api/replenishment'
 import { useAuthStore } from '../stores/auth'
 import { REPLENISHMENT_WIZARD_STEPS, canConvertSuggestion, getLocalDateString, issueActionMode } from './replenishment-workflow'
 
@@ -108,10 +108,13 @@ async function selectRun(run: ReplenishmentRun) {
 async function refreshCurrentRunData() {
   if (!selectedRun.value) return
   const runId = selectedRun.value.id
-  // Refresh selectedRun stats from run list
-  const runResp = await listRuns({ page_size: 1, id: runId })
-  if (runResp.items.length > 0) {
-    selectedRun.value = runResp.items[0]
+  // Refresh selectedRun stats from detail API
+  try {
+    selectedRun.value = await getReplenishmentRun(runId)
+  } catch {
+    selectedRun.value = null
+    ElMessage.error('当前运行已不存在或已被取消')
+    return
   }
   const sugResp = await listSuggestions(runId, {
     keyword: filters.keyword || undefined, review_status: filters.review_status || undefined,

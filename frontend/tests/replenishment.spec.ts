@@ -4,7 +4,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, vi } from 'vitest'
 
 import http from '../src/api/http'
-import { approveRun, bulkReviewSuggestions, calculateRun, cancelProductionDemand, convertSuggestions, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, reviewSuggestion, updateScheduledOverride, type ReplenishmentIssue, REPLENISHMENT_REQUEST_TIMEOUT_MS } from '../src/api/replenishment'
+import { approveRun, bulkReviewSuggestions, calculateRun, cancelProductionDemand, convertSuggestions, getReplenishmentRun, getSuggestion, listRunIssues, listRuns, listSuggestions, resolveRunIssue, reviewSuggestion, updateScheduledOverride, type ReplenishmentIssue, REPLENISHMENT_REQUEST_TIMEOUT_MS } from '../src/api/replenishment'
 import { useAuthStore } from '../src/stores/auth'
 import ProductionDemandView from '../src/views/ProductionDemandView.vue'
 import ReplenishmentView from '../src/views/ReplenishmentView.vue'
@@ -19,6 +19,7 @@ vi.mock('../src/api/replenishment', async (importOriginal) => {
     listRunIssues: vi.fn().mockResolvedValue({ items: [], total: 0 }),
     getSuggestion: vi.fn(),
     listProductionDemands: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+    getReplenishmentRun: vi.fn(),
   }
 })
 
@@ -130,6 +131,7 @@ describe('phase 3 replenishment UI', () => {
     }
     const issue: ReplenishmentIssue = { id: 8, run_id: 3, suggestion_id: 7, issue_code: 'SCHEDULED_ACTUAL_UNKNOWN', severity: 'BLOCKING', message: '实际量未知', status: 'OPEN', product_id: 9, details: null }
     vi.mocked(listRuns).mockResolvedValueOnce({ items: [run] as never[], total: 1 })
+    vi.mocked(getReplenishmentRun).mockResolvedValue({ ...run, order_inputs: [], audit_logs: [] } as never)
     vi.mocked(listSuggestions).mockResolvedValue({ items: [suggestion] as never[], total: 1 })
     vi.mocked(listRunIssues).mockResolvedValue({ items: [issue], total: 1 })
     vi.mocked(getSuggestion).mockResolvedValue({ ...suggestion, issues: [issue] } as never)

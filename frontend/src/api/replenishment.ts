@@ -44,6 +44,10 @@ export async function listReplenishmentSourceBatches(importType?: string) {
   return (await http.get<{ items: SourceBatch[] }>('/v1/replenishment/source-batches', { params })).data
 }
 
+export async function getReplenishmentRun(runId: number) {
+  return (await http.get<ReplenishmentRun & { order_inputs: Record<string, unknown>[]; audit_logs: Record<string, unknown>[] }>(`/v1/replenishment/runs/${runId}`)).data
+}
+
 export function describeReplenishmentError(error: unknown): string {
   if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
     return '计算请求超时，后端可能仍在执行，请刷新运行状态确认，不要重复提交'
