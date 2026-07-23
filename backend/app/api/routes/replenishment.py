@@ -277,7 +277,7 @@ def create_run(
         if batch.status != "COMPLETED":
             fail(request, "REPLENISHMENT_SOURCE_NOT_COMPLETED", f"{key} 来源批次尚未完成")
         batches[key] = batch
-    order_snapshot = [{"product_id": item.product_id, "order_qty": str(item.quantity), "source_document_no": item.source_document_no, "note": item.note} for item in payload.order_inputs]
+    order_snapshot = [{"product_id": item.product_id, "order_qty": str(item.quantity), "source_document_no": item.source_document_no, "reason": item.reason} for item in payload.order_inputs]
     fingerprint, snapshot = source_fingerprint(payload.calculation_date, batches, order_snapshot)
     source_dates = {key: batch.source_date.isoformat() if batch and batch.source_date else None for key, batch in batches.items()}
     calculation_config = {
@@ -396,7 +396,7 @@ def create_run(
 def get_run_detail(run_id: int, request: Request, db: Session = Depends(get_db), actor: User = Depends(require_permission("replenishment.view"))) -> dict[str, Any]:
     run = get_run(db, request, run_id)
     result = run_dict(run)
-    result["order_inputs"] = [{"product_id": item.product_id, "order_qty": item.order_qty, "source_document_no": item.source_document_no, "note": item.note} for item in db.scalars(select(ReplenishmentOrderInput).where(ReplenishmentOrderInput.run_id == run.id))]
+    result["order_inputs"] = [{"product_id": item.product_id, "order_qty": item.order_qty, "source_document_no": item.source_document_no, "reason": item.reason} for item in db.scalars(select(ReplenishmentOrderInput).where(ReplenishmentOrderInput.run_id == run.id))]
     audit_filters = [AuditLog.context_replenishment_run_id == run.id]
     if run.weekly_plan_batch_id:
         audit_filters.append(and_(

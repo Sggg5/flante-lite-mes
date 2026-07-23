@@ -501,7 +501,7 @@ def test_issue_resolution_policy_rejects_generic_business_bypasses(client, db, a
         product_name_raw="虚拟待匹配", specification_raw="VIRTUAL-SPEC", production_batch_no="VIRTUAL-LOT",
         process_name="包装", equipment_name="虚拟设备", plan_start_date=date(2026, 7, 13),
         plan_end_date=date(2026, 7, 19), daily_plan={}, daily_actual={}, weekly_plan_qty=10,
-        weekly_actual_qty=None, formula_metadata={}, match_status="MATCHED", matched_product_id=sources["products"][1].id, matched_by=1, matched_at=datetime.now(UTC), match_reason="????", **imported_kwargs(weekly.id, 8),
+        weekly_actual_qty=None, formula_metadata={}, match_status="MATCHED", matched_product_id=sources["products"][1].id, matched_by=1, matched_at=datetime.now(UTC), match_reason="虚拟匹配测试", **imported_kwargs(weekly.id, 8),
     ))
     db.commit()
     run_id = create_run(client, admin_token, sources, weekly_plan_batch_id=weekly.id, order_inputs=[{"product_id": sources["products"][0].id, "quantity": "500", "reason": "order input for test", "source_document_no": "PO-2026-0001"}]).json()["id"]

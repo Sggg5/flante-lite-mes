@@ -99,7 +99,7 @@ async function nextStep() {
 
 async function selectRun(run: ReplenishmentRun) {
   selectedRun.value = run
-  suggestionPage.value = 1; issuePage.value = 1; runPage.value = 1
+  suggestionPage.value = 1; issuePage.value = 1
   selectedSuggestions.value = []
   issueSeverity.value = ''; issueStatus.value = ''
   await refreshCurrentRunData()
@@ -108,6 +108,11 @@ async function selectRun(run: ReplenishmentRun) {
 async function refreshCurrentRunData() {
   if (!selectedRun.value) return
   const runId = selectedRun.value.id
+  // Refresh selectedRun stats from run list
+  const runResp = await listRuns({ page_size: 1, id: runId })
+  if (runResp.items.length > 0) {
+    selectedRun.value = runResp.items[0]
+  }
   const sugResp = await listSuggestions(runId, {
     keyword: filters.keyword || undefined, review_status: filters.review_status || undefined,
     positive_only: positiveOnly.value, page: suggestionPage.value, page_size: suggestionPageSize.value,
@@ -168,14 +173,14 @@ async function approveOne(row: ReplenishmentSuggestion) {
   const result = await ElMessageBox.prompt('确认数量；如修改系统建议量，请在下一步填写原因', '审核补库建议', { inputValue: row.confirmed_qty ?? row.system_suggested_qty })
   const reason = await ElMessageBox.prompt('请输入审核原因', '审核原因', { inputValue: '确认系统补库建议' })
   await reviewSuggestion(row.id, 'APPROVE', result.value, reason.value)
-  await openRun(selectedRun.value!)
+  await refreshCurrentRunData()
 }
 
 async function bulkApprove() {
   if (!selectedSuggestions.value.length) return ElMessage.warning('请先选择建议')
   const { value } = await ElMessageBox.prompt('请输入批量审核原因', '批量审核', { inputValue: '批量确认系统建议量' })
   await bulkReviewSuggestions(selectedSuggestions.value.map(item => item.id), 'APPROVE', value)
-  await openRun(selectedRun.value!)
+  await refreshCurrentRunData()
 }
 
 async function convertSelected() {
@@ -184,7 +189,7 @@ async function convertSelected() {
   try {
     await convertSuggestions(selectedRun.value.id, convertible.value.map(item => item.id), '人工确认转入生产需求池')
     ElMessage.success('已转入生产需求池；重复提交不会重复创建')
-    await openRun(selectedRun.value)
+    await refreshCurrentRunData()
     await refreshRuns()
   } catch (error) { ElMessage.error(describeReplenishmentError(error)) }
   finally { processing.value = false }
