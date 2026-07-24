@@ -28,6 +28,7 @@ from app.models import (
     Product,
     ProductImportChange,
     RegularProductionProduct,
+    ReplenishmentRun,
     ShipmentRecord,
     WeeklyPlanStagingRow,
 )
@@ -1157,7 +1158,19 @@ def rollback_product_import_changes(db: Session, batch: ImportBatch) -> list[dic
     return restoration_events
 
 
+def batch_referenced_by_replenishment(db: Session, batch: ImportBatch) -> bool:
+    return db.scalar(
+        select(func.count(ReplenishmentRun.id)).where(
+            (ReplenishmentRun.shipment_batch_id == batch.id)
+            | (ReplenishmentRun.inventory_batch_id == batch.id)
+            | (ReplenishmentRun.pipe_wip_batch_id == batch.id)
+            | (ReplenishmentRun.fitting_wip_batch_id == batch.id)
+            | (ReplenishmentRun.regular_product_batch_id == batch.id)
+            | (ReplenishmentRun.weekly_plan_batch_id == batch.id)
+        )
+    ) > 0
+
+
 def batch_has_downstream_references(db: Session, batch: ImportBatch) -> bool:
-    # Stage 2 has no downstream production models. Future stages extend this guard
-    # with explicit foreign-key reference checks before allowing rollback.
-    return False
+    """Generic extension point retained for downstream modules beyond phase 3."""
+    return batch_referenced_by_replenishment(db, batch)

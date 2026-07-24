@@ -49,6 +49,11 @@ export interface ImportBatch {
   created_by_name: string | null
   created_at: string
   confirmed_at: string | null
+  total_staging_rows?: number
+  matched_rows?: number
+  ignored_rows?: number
+  incomplete_rows?: number
+  matching_complete?: boolean
   cancel_reason: string | null
   source_date?: string | null
   include_hidden_rows?: boolean

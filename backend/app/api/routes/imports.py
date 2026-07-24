@@ -18,7 +18,7 @@ from app.api.dependencies import require_permission
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.errors import error_payload
-from app.models import AuditLog, ImportBatch, ImportedWeeklyPlanRaw, ImportRowIssue, Product, User, WeeklyPlanStagingRow
+from app.models import AuditLog, ImportBatch, ImportedWeeklyPlanRaw, ImportRowIssue, Product, ReplenishmentRun, User, WeeklyPlanStagingRow
 from app.schemas.imports import AnalyzeImportRequest, MatchWeeklyPlanRequest, RollbackImportRequest, UpdateImportOptionsRequest, UpdateMappingRequest
 from app.services.audit import write_audit_log
 from app.services.excel_import import (
@@ -27,6 +27,7 @@ from app.services.excel_import import (
     ImportValidationError,
     analyze_workbook,
     batch_has_downstream_references,
+    batch_referenced_by_replenishment,
     find_duplicate_import_batch,
     import_validated_batch,
     iter_normalized_rows,
@@ -469,6 +470,8 @@ def rollback_import(batch_id: int, payload: RollbackImportRequest, request: Requ
         raise HTTPException(status_code=404, detail=error_payload(request, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在"))
     if batch.status != "COMPLETED":
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_ROLLBACK_NOT_ALLOWED", "只有已完成批次可以撤销"))
+    if batch_referenced_by_replenishment(db, batch):
+        raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_BATCH_REFERENCED_BY_REPLENISHMENT", "导入批次已被补库运行引用，不能撤销"))
     if batch_has_downstream_references(db, batch):
         raise HTTPException(status_code=409, detail=error_payload(request, "IMPORT_BATCH_REFERENCED", "导入批次已被后续业务引用，不能撤销"))
     try:
@@ -571,6 +574,19 @@ def match_weekly_plan_staging(batch_id: int, staging_id: int, payload: MatchWeek
         raise HTTPException(
             status_code=409,
             detail=error_payload(request, "IMPORT_STATE_INVALID", "只有已完成且未撤销的周计划批次可以匹配或忽略", {"status": batch.status}),
+        )
+    referenced_run_id = db.scalar(select(ReplenishmentRun.id).where(
+        ReplenishmentRun.weekly_plan_batch_id == batch.id
+    ).limit(1))
+    if referenced_run_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=error_payload(
+                request,
+                "WEEKLY_PLAN_REFERENCED_BY_REPLENISHMENT",
+                "周计划已被补库运行引用，不能再匹配或忽略；请取消该运行并新建",
+                {"run_id": referenced_run_id},
+            ),
         )
     staging = db.scalar(
         select(WeeklyPlanStagingRow)

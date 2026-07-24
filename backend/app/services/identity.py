@@ -14,16 +14,30 @@ DEFAULT_PERMISSIONS = {
     "import.validate": "分析并校验导入数据",
     "import.confirm": "确认导入数据",
     "import.rollback": "撤销导入批次",
+    "replenishment.view": "查看补库运行、策略与建议",
+    "replenishment.policy.manage": "管理补库策略",
+    "replenishment.run.create": "创建补库运行",
+    "replenishment.run.calculate": "创建并计算补库运行",
+    "replenishment.review": "审核补库建议",
+    "replenishment.approve": "批准补库运行",
+    "replenishment.convert": "补库建议转生产需求",
+    "demand.view": "查看生产需求池",
+    "demand.cancel": "取消未分配生产需求",
 }
 
 DEFAULT_ROLES = {
     "ADMIN": ("系统管理员", set(DEFAULT_PERMISSIONS)),
     "PLANNER": (
         "生产计划员",
-        {"system.view", "import.view", "import.upload", "import.validate", "import.confirm"},
+        {"system.view", "import.view", "import.upload", "import.validate", "import.confirm"}
+        | {
+            "replenishment.view", "replenishment.run.create", "replenishment.run.calculate",
+            "replenishment.review", "replenishment.approve", "replenishment.convert",
+            "demand.view", "demand.cancel",
+        },
     ),
-    "FOREMAN": ("班组长", {"system.view"}),
-    "VIEWER": ("只读用户", {"system.view", "import.view"}),
+    "FOREMAN": ("班组长", {"system.view", "demand.view"}),
+    "VIEWER": ("只读用户", {"system.view", "import.view", "replenishment.view", "demand.view"}),
 }
 
 

@@ -12,6 +12,14 @@ from app.models.imports import (
     ShipmentRecord,
     WeeklyPlanStagingRow,
 )
+from app.models.replenishment import (
+    ProductionDemand,
+    ReplenishmentIssue,
+    ReplenishmentOrderInput,
+    ReplenishmentPolicy,
+    ReplenishmentRun,
+    ReplenishmentSuggestion,
+)
 
 __all__ = [
     "AuditLog",
@@ -24,7 +32,13 @@ __all__ = [
     "PipeWipSnapshot",
     "Product",
     "ProductImportChange",
+    "ProductionDemand",
     "RegularProductionProduct",
+    "ReplenishmentIssue",
+    "ReplenishmentOrderInput",
+    "ReplenishmentPolicy",
+    "ReplenishmentRun",
+    "ReplenishmentSuggestion",
     "Role",
     "RolePermission",
     "ShipmentRecord",

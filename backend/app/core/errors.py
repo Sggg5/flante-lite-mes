@@ -17,7 +17,11 @@ def error_payload(request: Request, code: str, message: str, details: Any = None
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        details = exc.errors()
+        for item in details:
+            if "ctx" in item:
+                item["ctx"] = {key: str(value) for key, value in item["ctx"].items()}
         return JSONResponse(
             status_code=422,
-            content=error_payload(request, "VALIDATION_ERROR", "请求参数校验失败", exc.errors()),
+            content=error_payload(request, "VALIDATION_ERROR", "请求参数校验失败", details),
         )

@@ -4,13 +4,15 @@ import MainLayout from '../layouts/MainLayout.vue'
 import DashboardView from '../views/DashboardView.vue'
 import LoginView from '../views/LoginView.vue'
 import ImportCenterView from '../views/ImportCenterView.vue'
+import ProductionDemandView from '../views/ProductionDemandView.vue'
+import ReplenishmentView from '../views/ReplenishmentView.vue'
 import PlaceholderView from '../views/PlaceholderView.vue'
 import { TOKEN_STORAGE_KEY } from '../api/http'
 
 const placeholderRoutes: RouteRecordRaw[] = [
   { path: 'imports', name: 'imports', component: ImportCenterView, meta: { title: '数据导入' } },
-  { path: 'replenishment', name: 'replenishment', component: PlaceholderView, meta: { title: '补库管理' } },
-  { path: 'demands', name: 'demands', component: PlaceholderView, meta: { title: '生产需求' } },
+  { path: 'replenishment', name: 'replenishment', component: ReplenishmentView, meta: { title: '补库管理' } },
+  { path: 'demands', name: 'demands', component: ProductionDemandView, meta: { title: '生产需求' } },
   { path: 'planning', name: 'planning', component: PlaceholderView, meta: { title: '生产计划' } },
   { path: 'execution', name: 'execution', component: PlaceholderView, meta: { title: '车间执行' } },
   { path: 'issues', name: 'issues', component: PlaceholderView, meta: { title: '异常预警' } },
