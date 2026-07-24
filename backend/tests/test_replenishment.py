@@ -703,6 +703,21 @@ def test_concurrent_identical_run_creation_creates_only_one_active_run(client, d
     )) == 1
 
 
+
+def test_get_run_detail_returns_order_input_reason(client, db, admin_token):
+    sources = source_fixture(db)
+    product_id = sources['products'][0].id
+    assert client.put(f'/api/v1/replenishment/policies/{product_id}', json={'algorithm': 'ORDER_BASED', 'rounding_mode': 'NONE', 'reason': '订单生产'}, headers=auth(admin_token)).status_code == 200
+    order_reason = '现场确认订单需求'
+    resp = create_run(client, admin_token, sources, order_inputs=[{'product_id': product_id, 'quantity': '100', 'reason': order_reason, 'source_document_no': 'PO-TEST-001'}])
+    assert resp.status_code == 201
+    run_id = resp.json()['id']
+    detail = client.get(f'/api/v1/replenishment/runs/{run_id}', headers=auth(admin_token))
+    assert detail.status_code == 200
+    data = detail.json()
+    assert len(data['order_inputs']) == 1
+    assert data['order_inputs'][0]['reason'] == order_reason
+
 def test_quantity_database_constraints_reject_invalid_values(db):
     sources = source_fixture(db)
     run = ReplenishmentRun(

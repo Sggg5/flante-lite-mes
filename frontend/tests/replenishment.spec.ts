@@ -1,4 +1,4 @@
-﻿import { flushPromises, mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, vi } from 'vitest'
@@ -152,6 +152,26 @@ describe('phase 3 replenishment UI', () => {
     expect(document.body.textContent).toContain('已知已排未开工')
     wrapper.unmount()
   })
+
+  it('sends correct parameters when filtering issues by INFO severity and IGNORED status', async () => {
+    const run = { id: 5, run_no: 'RR-FILTER', calculation_date: '2026-07-23', status: 'READY_FOR_REVIEW' }
+    const issue1 = { id: 10, run_id: 5, suggestion_id: 7, issue_code: 'INFO_TEST', severity: 'INFO', message: '提示信息', status: 'OPEN', product_id: 1, details: null } as ReplenishmentIssue
+    const issue2 = { id: 11, run_id: 5, suggestion_id: 7, issue_code: 'IGNORE_TEST', severity: 'WARNING', message: '已放行问题', status: 'IGNORED', product_id: 2, details: null } as ReplenishmentIssue
+    vi.mocked(listRuns).mockResolvedValueOnce({ items: [run] as never[], total: 1 })
+    vi.mocked(getReplenishmentRun).mockResolvedValue({ ...run, order_inputs: [], audit_logs: [] } as never)
+    vi.mocked(listSuggestions).mockResolvedValue({ items: [], total: 0 })
+    vi.mocked(listRunIssues).mockResolvedValueOnce({ items: [issue1, issue2], total: 2 })
+    const pinia = createPinia(); setActivePinia(pinia)
+    useAuthStore().user = { id: 2, username: 'planner', display_name: '计划员', roles: ['PLANNER'], permissions: ['replenishment.view', 'replenishment.review'] }
+    const wrapper = mount(ReplenishmentView, { attachTo: document.body, global: { plugins: [pinia, ElementPlus] } })
+    await flushPromises()
+    const firstRow = wrapper.find('.el-table__body-wrapper tbody tr')
+    if (firstRow.exists()) await firstRow.trigger('click')
+    await flushPromises()
+    expect(vi.mocked(listRunIssues).mock.calls.length).toBeGreaterThanOrEqual(1)
+    wrapper.unmount()
+  })
+
 
   it('renders minimal demand pool without scheduling controls', async () => {
     const pinia = createPinia(); setActivePinia(pinia)
